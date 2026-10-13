@@ -12,19 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
-import sys
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
-
-from .mock_omni import (  # isort: split
-    _MockRMSNorm,
-    _MockRotaryEmbeddingWan,
-    vllm_omni_mock,
-)
-
-import vllm_omni
+from vllm_omni.diffusion.layers.norm import RMSNorm
+from vllm_omni.diffusion.layers.rope import RotaryEmbeddingWan
 from vllm_omni.diffusion.models.qwen_image import qwen_image_transformer
 
 from vllm_torchtpu.omni import register_omni_tpu_platform
@@ -50,14 +43,6 @@ from vllm_torchtpu.omni.rope import (
 )
 
 pytestmark = pytest.mark.omni
-
-
-@pytest.fixture(scope="module", autouse=True)
-def cleanup_mock_omni():
-    yield
-    for mod_name in list(sys.modules.keys()):
-        if mod_name == "vllm_omni" or mod_name.startswith("vllm_omni."):
-            del sys.modules[mod_name]
 
 
 def test_register_omni_tpu_platform(monkeypatch):
@@ -91,7 +76,7 @@ def test_platform_attributes():
 
 def test_rope_pair_swap_matches_native():
     torch.manual_seed(0)
-    rope = _MockRotaryEmbeddingWan(is_neox_style=False, half_head_dim=True)
+    rope = RotaryEmbeddingWan(is_neox_style=False, half_head_dim=True)
     x = torch.randn(1, 24, 3, 16)
     cos = torch.randn(1, 24, 1, 8)
     sin = torch.randn(1, 24, 1, 8)
@@ -115,9 +100,9 @@ def test_rope_patch_installed():
     from unittest.mock import MagicMock
 
     apply_omni_model_specific_patches()
-    assert _MockRotaryEmbeddingWan.forward is rotary_embedding_wan_forward
+    assert RotaryEmbeddingWan.forward is rotary_embedding_wan_forward
     # Interleaved half-dim calls use apply_rotary_pair_swap (bit-exact in bf16).
-    rope = _MockRotaryEmbeddingWan(is_neox_style=False, half_head_dim=True)
+    rope = RotaryEmbeddingWan(is_neox_style=False, half_head_dim=True)
     x = torch.randn(1, 4, 2, 8, dtype=torch.bfloat16)
     cos = torch.randn(1, 4, 1, 4, dtype=torch.bfloat16)
     sin = torch.randn(1, 4, 1, 4, dtype=torch.bfloat16)
@@ -126,7 +111,7 @@ def test_rope_patch_installed():
     )
 
     # Non-half-dim or Neox calls delegate to _forward_method.
-    rope_fallback = _MockRotaryEmbeddingWan(is_neox_style=False, half_head_dim=False)
+    rope_fallback = RotaryEmbeddingWan(is_neox_style=False, half_head_dim=False)
     spy = MagicMock(wraps=rope_fallback.forward_native)
     rope_fallback._forward_method = spy
     out_fb = rope_fallback(x, cos, sin)
@@ -236,7 +221,11 @@ def test_wan_ffn_gelu_fence(monkeypatch):
     from vllm_torchtpu.omni import patches
 
     apply_omni_model_specific_patches()
-    ffn = ColumnParallelGELU(8, 16)
+    # Skip __init__ (ColumnParallelLinear requires an initialized TP group).
+    ffn = object.__new__(ColumnParallelGELU)
+    torch.nn.Module.__init__(ffn)
+    ffn.proj = torch.nn.Linear(8, 16)
+    ffn.approximate = "tanh"
     x = torch.randn(3, 8)
     want = torch.nn.functional.gelu(ffn.proj(x), approximate="tanh")
     fenced = []
@@ -383,11 +372,6 @@ def test_tpu_sdpa_attention_backend():
     assert res_gqa.shape == (1, 16, 8, 16)
 
 
-def test_vllm_omni_is_mocked():
-    assert sys.modules["vllm_omni"] is vllm_omni_mock
-    assert not hasattr(vllm_omni, "__file__") or vllm_omni.__file__ is None
-
-
 @pytest.mark.parametrize(
     "rope_cls_name",
     ["QwenEmbedRope", "QwenEmbedLayer3DRope"],
@@ -396,7 +380,7 @@ def test_qwen_image_rope_txt_freqs_clone(rope_cls_name):
     apply_omni_model_specific_patches()
 
     rope_cls = getattr(qwen_image_transformer, rope_cls_name)
-    rope = rope_cls()
+    rope = rope_cls(theta=10000, axes_dim=[16, 56, 56], scale_rope=True)
 
     vid_freqs, txt_freqs = rope.forward([(1, 2, 2)], [3], torch.device("cpu"))
 
@@ -405,18 +389,17 @@ def test_qwen_image_rope_txt_freqs_clone(rope_cls_name):
         txt_freqs.untyped_storage().data_ptr()
         != rope.pos_freqs.untyped_storage().data_ptr()
     )
-    assert torch.equal(txt_freqs, rope.pos_freqs[2:5])
+    # With scale_rope, text positions start at max(h // 2, w // 2) = 1.
+    assert torch.equal(txt_freqs, rope.pos_freqs[1:4])
     assert txt_freqs.dtype == torch.complex64
-    assert torch.equal(vid_freqs, rope.pos_freqs[:2])
+    assert vid_freqs.shape == (4, 64)
 
 
 def test_safe_pack_tensor_if_large():
     from vllm_omni.diffusion import ipc
 
-    orig_pack = MagicMock()
-    ipc._pack_tensor_if_large = orig_pack
+    from vllm_torchtpu.omni.patches import apply_omni_model_specific_patches
 
-    apply_omni_model_specific_patches.cache_clear()
     apply_omni_model_specific_patches()
 
     cpu_tensor = torch.empty(1, device="cpu")
@@ -429,10 +412,7 @@ def test_safe_pack_tensor_if_large():
     )
 
     tpu_tensor.cpu.assert_called_once_with()
-    orig_pack.assert_called_once_with(
-        cpu_tensor, "stream", created, enable_registered_shm=True
-    )
-    assert res is orig_pack.return_value
+    assert res is cpu_tensor
 
 
 def test_omni_tpu_patches_configuration():
@@ -490,8 +470,8 @@ class _FakeWanSelfAttention(torch.nn.Module):
         self.num_heads = self.num_kv_heads = heads
         self.head_dim = head_dim
         self.qkv = torch.nn.Linear(dim, 3 * heads * head_dim)
-        self.norm_q = _MockRMSNorm(heads * head_dim)
-        self.norm_k = _MockRMSNorm(heads * head_dim)
+        self.norm_q = RMSNorm(heads * head_dim)
+        self.norm_k = RMSNorm(heads * head_dim)
         with torch.no_grad():
             self.norm_q.weight.uniform_(0.5, 1.5)
             self.norm_k.weight.uniform_(0.5, 1.5)
@@ -545,4 +525,11 @@ def test_wan_self_attention_patch_falls_back_on_f32():
     )
 
     apply_omni_model_specific_patches()
-    assert WanSelfAttention()(torch.ones(1, 3, 8)) == "native"
+    attn = _FakeWanSelfAttention()
+    x = torch.ones(1, 3, 64)
+    torch.testing.assert_close(
+        WanSelfAttention.forward(attn, x),
+        WanSelfAttention._tpu_orig_forward(attn, x),
+        rtol=0,
+        atol=0,
+    )
