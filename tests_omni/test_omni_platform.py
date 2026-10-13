@@ -16,6 +16,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+from vllm_omni.diffusion import ipc
 from vllm_omni.diffusion.layers.norm import RMSNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbeddingWan
 from vllm_omni.diffusion.models.qwen_image import qwen_image_transformer
@@ -97,8 +98,6 @@ def test_rope_pair_swap_matches_native():
 
 
 def test_rope_patch_installed():
-    from unittest.mock import MagicMock
-
     apply_omni_model_specific_patches()
     assert RotaryEmbeddingWan.forward is rotary_embedding_wan_forward
     # Interleaved half-dim calls use apply_rotary_pair_swap (bit-exact in bf16).
@@ -396,9 +395,6 @@ def test_qwen_image_rope_txt_freqs_clone(rope_cls_name):
 
 
 def test_safe_pack_tensor_if_large():
-    from vllm_omni.diffusion import ipc
-
-    from vllm_torchtpu.omni.patches import apply_omni_model_specific_patches
 
     apply_omni_model_specific_patches()
 
