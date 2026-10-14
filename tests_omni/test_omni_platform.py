@@ -395,7 +395,6 @@ def test_qwen_image_rope_txt_freqs_clone(rope_cls_name):
 
 
 def test_safe_pack_tensor_if_large():
-
     apply_omni_model_specific_patches()
 
     cpu_tensor = torch.empty(1, device="cpu")
