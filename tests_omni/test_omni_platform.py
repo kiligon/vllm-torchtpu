@@ -20,6 +20,9 @@ from vllm_omni.diffusion import ipc
 from vllm_omni.diffusion.layers.norm import RMSNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbeddingWan
 from vllm_omni.diffusion.models.qwen_image import qwen_image_transformer
+from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import (
+    WanSelfAttention,
+)
 
 from vllm_torchtpu.omni import register_omni_tpu_platform
 from vllm_torchtpu.omni import rope as omni_rope
@@ -459,52 +462,43 @@ def _reference_qk_norm_rope(qkv, wq, wk, cos, sin, eps, head_dim):
     return tuple(outs)
 
 
-class _FakeWanSelfAttention(torch.nn.Module):
-    def __init__(self, dim=64, heads=2, head_dim=128):
-        super().__init__()
-        self.num_heads = self.num_kv_heads = heads
-        self.head_dim = head_dim
-        self.qkv = torch.nn.Linear(dim, 3 * heads * head_dim)
-        self.norm_q = RMSNorm(heads * head_dim)
-        self.norm_k = RMSNorm(heads * head_dim)
-        with torch.no_grad():
-            self.norm_q.weight.uniform_(0.5, 1.5)
-            self.norm_k.weight.uniform_(0.5, 1.5)
-        self.to_gate_compress = None
-        self.to_out = torch.nn.Identity()
-        self.dropout = torch.nn.Identity()
-
-    def to_qkv(self, x):
-        return self.qkv(x), None
-
-    def attn(self, q, k, v, attn_metadata=None):
-        return q * 3 + k * 2 + v
+def _make_wan_self_attention(dim=64, heads=2, head_dim=128) -> WanSelfAttention:
+    attn = object.__new__(WanSelfAttention)
+    torch.nn.Module.__init__(attn)
+    attn.num_heads = attn.num_kv_heads = heads
+    attn.head_dim = head_dim
+    qkv = torch.nn.Linear(dim, 3 * heads * head_dim)
+    attn.to_qkv = lambda x: (qkv(x), None)
+    attn.norm_q = RMSNorm(heads * head_dim)
+    attn.norm_k = RMSNorm(heads * head_dim)
+    with torch.no_grad():
+        attn.norm_q.weight.uniform_(0.5, 1.5)
+        attn.norm_k.weight.uniform_(0.5, 1.5)
+    attn.rotary_embedding = RotaryEmbeddingWan(is_neox_style=False, half_head_dim=True)
+    attn.to_gate_compress = None
+    attn.to_out = torch.nn.Identity()
+    attn.dropout = torch.nn.Identity()
+    attn.attn = lambda q, k, v, attn_metadata=None: q * 3 + k * 2 + v
+    return attn
 
 
 def test_wan_self_attention_fused_matches_native(monkeypatch):
     # The fused forward's glue (flattening, tables, value slice) around the
     # kernel reproduces vLLM-Omni's norm -> unflatten -> RoPE -> attention.
+    apply_omni_model_specific_patches()
     torch.manual_seed(0)
-    attn = _FakeWanSelfAttention()
+    attn = _make_wan_self_attention()
     batch, seq, half = 2, 5, attn.head_dim // 2
     x = torch.randn(batch, seq, 64)
     cos, sin = torch.randn(1, seq, 1, half), torch.randn(1, seq, 1, half)
     monkeypatch.setattr(omni_rope, "_qk_norm_rope_op", lambda: _reference_qk_norm_rope)
     out = wan_self_attention_fused(attn, x, (cos, sin))
-
-    qkv, _ = attn.to_qkv(x)
-    q, k, v = qkv.split(attn.num_heads * attn.head_dim, dim=-1)
-    shape = (attn.num_heads, attn.head_dim)
-    q = _rms_norm(q, attn.norm_q.weight, 1e-6).unflatten(2, shape)
-    k = _rms_norm(k, attn.norm_k.weight, 1e-6).unflatten(2, shape)
-    q = apply_rotary_pair_swap(q, cos, sin)
-    k = apply_rotary_pair_swap(k, cos, sin)
-    want = attn.attn(q, k, v.unflatten(2, shape)).flatten(2, 3)
+    want = WanSelfAttention._tpu_orig_forward(attn, x, (cos, sin))
     torch.testing.assert_close(out, want)
 
 
 def test_can_fuse_qk_norm_rope():
-    attn = _FakeWanSelfAttention()
+    attn = _make_wan_self_attention()
     rot = (torch.ones(1, 3, 1, 64), torch.ones(1, 3, 1, 64))
     bf16_x = torch.ones(1, 3, 64, dtype=torch.bfloat16)
     assert can_fuse_qk_norm_rope(attn, bf16_x, rot)
@@ -515,15 +509,11 @@ def test_can_fuse_qk_norm_rope():
 
 
 def test_wan_self_attention_patch_falls_back_on_f32():
-    from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import (
-        WanSelfAttention,
-    )
-
     apply_omni_model_specific_patches()
-    attn = _FakeWanSelfAttention()
+    attn = _make_wan_self_attention()
     x = torch.ones(1, 3, 64)
     torch.testing.assert_close(
-        WanSelfAttention.forward(attn, x),
+        attn(x),
         WanSelfAttention._tpu_orig_forward(attn, x),
         rtol=0,
         atol=0,
