@@ -80,7 +80,13 @@ def _check_tpu_devices(degrees: dict[str, int]) -> None:
 @pytest.mark.parametrize(
     "omni_runner,config,degrees",
     [
-        pytest.param((c.path, None, degrees), c, degrees, id=case_id, marks=marks)
+        pytest.param(
+            (c.path, None, degrees),
+            c,
+            degrees,
+            id=f"{c.config_id}_{case_id}",
+            marks=marks,
+        )
         for c, degrees, case_id, marks in CASES
     ],
     indirect=["omni_runner"],
