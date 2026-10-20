@@ -41,8 +41,7 @@ RING_UNSUPPORTED = (
     "torch_tpu's P2P send (ProcessGroupTpu.experimental_send)"
 )
 
-# Parallel degrees are passed to OmniRunner as extra kwargs; Omni silently
-# ignores a parallel_config object.
+# Parallel degrees are passed as flat extra kwargs into OmniRunner
 CASES = [
     (WAN2_1_T2V_1_3B, {"cfg_parallel_size": 2}, "cfg2", ()),
     (WAN2_1_T2V_1_3B, {"ulysses_degree": 2}, "u2", ()),
@@ -98,10 +97,12 @@ def test_wan_multirank_golden_answers_tpu(
     degrees: dict[str, int],
 ):
     """Verify multi-rank Wan2.1 T2V output against the CPU fp32 golden video."""
-    world_size = DiffusionParallelConfig(**degrees).world_size
-    parallel = omni_runner.engine.stage_clients[0].od_config.parallel_config
-    assert parallel.world_size == world_size, (
-        f"Engine runs {parallel.world_size} ranks, expected {world_size}"
+    expected_parallel = DiffusionParallelConfig(**degrees)
+    parallel = DiffusionParallelConfig(
+        **omni_runner.stage_configs[0].engine_args.parallel_config
+    )
+    assert parallel == expected_parallel, (
+        f"Engine parallel_config {parallel} != expected {expected_parallel}"
     )
     inputs, sampling_params = build_wan_golden_request(config)
     outputs = list(omni_runner.generate(inputs, sampling_params))
