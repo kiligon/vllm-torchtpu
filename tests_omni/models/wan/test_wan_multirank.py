@@ -72,7 +72,7 @@ def _check_tpu_devices(degrees: dict[str, int]) -> None:
     world_size = DiffusionParallelConfig(**degrees).world_size
     # PCI scan: counts TPU devices without starting the TPU runtime here.
     device_count = hardware.get_tpu_device_count()
-    assert device_count < world_size, (
+    assert device_count >= world_size, (
         f"Test requires {world_size} TPU devices, found {device_count}"
     )
 
