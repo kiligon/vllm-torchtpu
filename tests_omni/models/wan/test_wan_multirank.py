@@ -97,12 +97,17 @@ def test_wan_multirank_golden_answers_tpu(
     degrees: dict[str, int],
 ):
     """Verify multi-rank Wan2.1 T2V output against the CPU fp32 golden video."""
-    expected_parallel = DiffusionParallelConfig(**degrees)
-    parallel = DiffusionParallelConfig(
-        **omni_runner.stage_configs[0].engine_args.parallel_config
-    )
-    assert parallel == expected_parallel, (
-        f"Engine parallel_config {parallel} != expected {expected_parallel}"
+    stage_parallel = omni_runner.stage_configs[0].parallel_config
+    expected = {
+        "cfg_parallel_size": 1,
+        "ulysses_degree": 1,
+        "ring_degree": 1,
+        "tensor_parallel_size": 1,
+        **degrees,
+    }
+    actual = {name: getattr(stage_parallel, name) for name in expected}
+    assert actual == expected, (
+        f"Engine parallel degrees {actual} != expected {expected}"
     )
     inputs, sampling_params = build_wan_golden_request(config)
     outputs = list(omni_runner.generate(inputs, sampling_params))
