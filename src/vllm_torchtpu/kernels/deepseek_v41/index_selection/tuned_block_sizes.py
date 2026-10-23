@@ -57,6 +57,9 @@ class PagedMQAConfig:
 # TPU v7, H32/D128, transposed packed FP8 pages; measured at P-state 7.
 PACKED_FP8_MQA_CONFIG = PagedMQAConfig(6, 32768, 8, 6, 4)
 
+# Dense tiles follow configured decode width, capped at one 256-row H32 MXU tile.
+PACKED_FP8_MAX_QUERY_TILE = 8
+
 # (queries, context, candidate blocks, topk, block size, cache banks).
 # 96 = lcm(6 query rows, 32 SparseCore subcores). Three independent chunks
 # expose TC/SC overlap without changing each query's six-row head grouping.

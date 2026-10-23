@@ -18,6 +18,8 @@ def candidate_topk(
     scores: jax.Array, candidates: jax.Array, *, k: int, block_size: int
 ) -> jax.Array:
     """Select compact scores and return ascending logical token IDs."""
+    if k == 0:
+        return jnp.empty((scores.shape[0], 0), jnp.int32)
     if jax.default_backend() != "tpu" or k % plsc.get_sparse_core_info().num_lanes:
         values, indices = jax.lax.top_k(scores, k)
         blocks = jnp.take_along_axis(candidates, indices // block_size, axis=1)
@@ -144,76 +146,3 @@ def candidate_membership(
         )
     )
     return mask[:, :blocks], canonical[:, :capacity]
-
-
-def compact_candidate_scores(
-    scores: jax.Array, candidates: jax.Array, *, block_size: int
-) -> jax.Array:
-    """Gather canonical candidate blocks into [T, candidates * block_size].
-
-    The TensorCore scorer's full-width intermediate is read into SparseCore
-    VMEM; only compact scores leave this stage. No full-width masked copy is made.
-    """
-    rows, width = scores.shape
-    capacity = candidates.shape[1]
-    output_width = capacity * block_size
-
-    def gather_scores():
-        indices = candidates[:, :, None] * block_size + jnp.arange(block_size)
-        valid = (candidates[:, :, None] >= 0) & (indices < width)
-        indices = indices.reshape(rows, output_width)
-        result = jnp.take_along_axis(scores, jnp.clip(indices, 0, width - 1), axis=1)
-        return jnp.where(valid.reshape(rows, output_width), result, -jnp.inf)
-
-    if jax.default_backend() != "tpu" or output_width == 0:
-        return gather_scores()
-
-    info = plsc.get_sparse_core_info()
-    lanes = info.num_lanes
-    alignment = pltpu.get_tpu_info().num_lanes
-    id_width = pl.cdiv(capacity, alignment) * alignment
-    out_width = pl.cdiv(output_width, alignment) * alignment
-    if 4 * (width + id_width + out_width) > info.vmem_capacity_bytes:
-        return gather_scores()
-    mesh = plsc.VectorSubcoreMesh(core_axis_name="core", subcore_axis_name="subcore")
-
-    @pl.kernel(
-        mesh=mesh,
-        out_type=jax.ShapeDtypeStruct((rows, out_width), jnp.float32),
-        scratch_types=(
-            pltpu.VMEM((width,), jnp.float32),
-            pltpu.VMEM((id_width,), jnp.int32),
-            pltpu.VMEM((out_width,), jnp.float32),
-            pltpu.SemaphoreType.DMA((2,)),
-        ),
-        compiler_params=pltpu.CompilerParams(needs_layout_passes=False),
-        name="packed_fp8_candidate_scores_sc",
-    )
-    def kernel(src, ids_src, out, values, ids, compact, sem):
-        lane_ids = jnp.arange(lanes, dtype=jnp.int32)
-        first = jax.lax.axis_index((mesh.core_axis_name, mesh.subcore_axis_name))
-
-        @pl.loop(first, rows, step=mesh.num_cores * mesh.num_subcores)
-        def row(row_id):
-            value_copy = pltpu.async_copy(src.at[row_id], values, sem.at[0])
-            pltpu.async_copy(ids_src.at[row_id], ids, sem.at[1]).wait()
-            value_copy.wait()
-
-            @plsc.parallel_loop(0, out_width, lanes, unroll=alignment // lanes)
-            def gather(i):
-                slots = i + lane_ids
-                unsigned_slots = slots.astype(jnp.uint32)
-                block_slots = (unsigned_slots // block_size).astype(jnp.int32)
-                offsets = (unsigned_slots % block_size).astype(jnp.int32)
-                blocks = plsc.load_gather(ids, [block_slots])
-                logical = blocks * block_size + offsets
-                valid = (slots < output_width) & (blocks >= 0) & (logical < width)
-                selected = plsc.load_gather(values, [logical], mask=valid)
-                compact[pl.ds(i, lanes)] = jnp.where(valid, selected, -jnp.inf)
-
-            pltpu.async_copy(compact, out.at[row_id], sem.at[0]).wait()
-
-    return kernel(
-        scores,
-        jnp.pad(candidates, ((0, 0), (0, id_width - capacity)), constant_values=-1),
-    )[:, :output_width]

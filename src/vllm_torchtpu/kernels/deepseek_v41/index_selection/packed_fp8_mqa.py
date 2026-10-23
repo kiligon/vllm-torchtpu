@@ -22,6 +22,11 @@ from vllm_torchtpu.kernels.deepseek_v41.index_selection._packed_fp8_math import 
     head_order,
     reduce_heads,
 )
+from vllm_torchtpu.kernels.deepseek_v41.index_selection._packed_fp8_packing import (
+    CandidateLayout,
+    PagePacking,
+    pack_score_page,
+)
 from vllm_torchtpu.kernels.deepseek_v41.index_selection._packed_fp8_pipeline import (
     BufferPlan,
     Pipeline,
@@ -52,16 +57,23 @@ class MQAOps:
     page_table: Ref
     q_scale: Ref
     out: Ref
+    candidate_pages: Ref | None
+    candidate_block_size: int
     queries: Ref
     prepared_queries: Ref
     keys: Ref
     scores: Ref
+    compact_scores: Ref | None
     output_counts: Ref
     pages: Ref
     read_sem: Ref
     write_sem: Ref
     q_sem: Ref
     page_sem: Ref
+    packing: Ref | None
+    packing_bounds: Ref | None
+    packing_bounds_smem: Ref | None
+    packing_sem: Ref | None
     skip_invalid_pages: bool
     next_tiles: jax.Array = field(init=False)
     next_group: jax.Array = field(init=False)
@@ -100,6 +112,14 @@ class MQAOps:
             transfer.start()
 
     def begin_query(self, following: QueryTile, lookahead: QueryTile) -> None:
+        """
+        execution steps:
+        1. Compute next group's K tile count (for cross-group K prefetching).
+        2. Await next group's page table load (VMEM to SMEM).
+        3. Trigger async page table load for the lookahead group.
+        4. Prefetch next group's Q into the alternate buffer.
+        5. Prepare current group parameters.
+        """
         c = self.plan.config
         self.next_group = following.key_group
         next_limit = jnp.int32(0)
@@ -122,6 +142,8 @@ class MQAOps:
             self.load_page_table(lookahead, (self.metadata_slot + 2) & 3)
 
         self.prefetch_query(following, 1 - self.query_slot)
+
+        # prepare metadata
         limit = jnp.int32(0)
         self.minimum_length = jnp.int32(jnp.iinfo(jnp.int32).max)
         row_lengths, row_weights, row_scales = ([], [], [])
@@ -146,9 +168,58 @@ class MQAOps:
         self.reduction_selector = (jnp.arange(6)[:, None] == owners[None, :]).astype(
             jnp.bfloat16
         )
+        if self.packing is not None:
+            assert self.candidate_pages is not None
+            assert self.packing_bounds is not None
+            assert self.packing_bounds_smem is not None
+            assert self.packing_sem is not None
+            layout = PagePacking(self.candidate_block_size)
+            for field in range(layout.fields):
+                self.packing[field] = jnp.stack(
+                    [
+                        self.candidate_pages[
+                            field,
+                            jnp.minimum(
+                                self.state.query.start + row, self.q.shape[0] - 1
+                            ),
+                        ]
+                        for row in range(c.query_tile)
+                    ]
+                )
+            descriptor = self.packing[0]
+            starts = (descriptor >> layout.count_bits) * layout.stride
+            counts = (descriptor & ((1 << layout.count_bits) - 1)) * layout.stride
+            visible = (
+                jnp.arange(self.plan.page_count)[None, :] * PAGE_RECORDS
+                < self.row_lengths[:, None]
+            )
+            self.packing[0] = jnp.where(
+                visible,
+                descriptor,
+                (descriptor >> layout.count_bits) << layout.count_bits,
+            )
+            live = visible & (counts > 0)
+            self.packing_bounds[0] = jnp.min(
+                jnp.where(
+                    live,
+                    starts // PAGE_RECORDS,
+                    pl.cdiv(self.plan.candidate_width, PAGE_RECORDS),
+                ),
+                axis=0,
+            )
+            self.packing_bounds[1] = jnp.max(
+                jnp.where(live, pl.cdiv(starts + counts, PAGE_RECORDS), 0), axis=0
+            )
+            pltpu.make_async_copy(
+                self.packing_bounds, self.packing_bounds_smem, self.packing_sem
+            ).start()
 
     def wait_query(self) -> None:
         self.copy_queries(self.state.query, self.query_slot, wait=True)
+        if self.packing_bounds is not None:
+            pltpu.make_async_copy(
+                self.packing_bounds, self.packing_bounds_smem, self.packing_sem
+            ).wait()
         c = self.plan.config
         lhs = self.queries[pl.ds(self.query_slot * c.query_tile, c.query_tile)].reshape(
             c.query_tile * self.plan.heads, DIM
@@ -169,6 +240,10 @@ class MQAOps:
         self.lhs = pltpu.annotate(self.prepared_queries, no_store=True)[
             query_slice
         ].reshape(c.query_tile * self.plan.heads, DIM)
+        if self.compact_scores is not None:
+            self.compact_scores[self.query_slot] = jnp.full(
+                self.compact_scores.shape[1:], -jnp.inf, jnp.float32
+            )
 
     def prefetch_query(self, query: QueryTile, slot) -> None:
         """Load the next Q tile, zeroing unused rows for ragged groups."""
@@ -245,6 +320,8 @@ class MQAOps:
         return flag != 0
 
     def output_slot(self, tile):
+        if self.plan.candidate_width:
+            return 0
         return 2 * (self.state.step & 1) + (tile & 1)
 
     def clear_output(self, tile) -> None:
@@ -256,6 +333,18 @@ class MQAOps:
         # Only the recorded rows own outstanding completions. A tile with
         # zero live queries must not wait on an unissued output transfer.
         count = self.output_counts[pair]
+        if self.compact_scores is not None:
+            for local in range(self.plan.config.query_tile):
+
+                @pl.when(local < count)
+                def wait_compact(local=local):
+                    src = self.compact_scores.at[pair, pl.ds(local, 1)]
+                    pltpu.make_async_copy(
+                        src, src, self.write_sem.at[pair, local]
+                    ).wait()
+
+            self.output_counts[pair] = jnp.int32(0)
+            return
         tiles = self.plan.page_count * PAGE_RECORDS // self.plan.config.key_tile
         for local_slot in range(min(2, tiles)):
             slot = pair * 2 + local_slot
@@ -271,6 +360,10 @@ class MQAOps:
         self.output_counts[pair] = jnp.int32(0)
 
     def publish(self, tile, wait: bool = False, *, slot=None) -> None:
+        if self.compact_scores is not None:
+            if not wait:
+                self.pack_output(tile)
+            return
         slot = self.output_slot(tile) if slot is None else slot
         for local in range(self.plan.config.query_tile):
 
@@ -291,6 +384,93 @@ class MQAOps:
                     transfer.wait()
                 else:
                     transfer.start()
+
+    def pack_output(self, tile) -> None:
+        assert self.packing is not None
+        assert self.packing_bounds_smem is not None
+        assert self.compact_scores is not None
+        pages = self.plan.config.key_tile // PAGE_RECORDS
+
+        def page(local, _):
+            index = tile * pages + local
+            first = self.packing_bounds_smem[0, index]
+            end = self.packing_bounds_smem[1, index]
+
+            @pl.when(first < end)
+            def pack():
+                indices = jnp.full(
+                    (self.plan.config.query_tile, 1), index % PAGE_RECORDS, jnp.int32
+                )
+                fields = [
+                    jnp.take_along_axis(
+                        self.packing[
+                            field,
+                            :,
+                            pl.ds(index // PAGE_RECORDS * PAGE_RECORDS, PAGE_RECORDS),
+                        ],
+                        indices,
+                        axis=1,
+                        mode="promise_in_bounds",
+                    )
+                    for field in range(self.packing.shape[0])
+                ]
+                values, starts, ends = pack_score_page(
+                    self.scores[0, :, pl.ds(local * PAGE_RECORDS, PAGE_RECORDS)],
+                    jnp.concatenate(fields, axis=1),
+                    block_size=self.candidate_block_size,
+                )
+
+                def write(destination, _):
+                    columns = (
+                        destination * PAGE_RECORDS
+                        + jnp.arange(PAGE_RECORDS, dtype=jnp.int32)[None, :]
+                    )
+                    pltpu.store(
+                        self.compact_scores.at[
+                            self.query_slot,
+                            :,
+                            pl.ds(destination * PAGE_RECORDS, PAGE_RECORDS),
+                        ],
+                        values,
+                        mask=(columns >= starts) & (columns < ends),
+                    )
+
+                jax.lax.fori_loop(first, end, write, None)
+
+        jax.lax.fori_loop(0, pages, page, None)
+
+    def finish_output(self) -> None:
+        if self.compact_scores is not None:
+            for local in range(self.plan.config.query_tile):
+
+                @pl.when(local < self.count)
+                def copy(local=local):
+                    pltpu.make_async_copy(
+                        self.compact_scores.at[self.query_slot, pl.ds(local, 1)],
+                        self.out.at[pl.ds(self.state.query.start + local, 1)],
+                        self.write_sem.at[self.query_slot, local],
+                    ).start()
+
+            self.output_counts[self.query_slot] = self.count
+            return
+
+        tiles = self.plan.page_count * PAGE_RECORDS // self.plan.config.key_tile
+
+        @pl.when(self.live_tiles == tiles)
+        def retain_outputs():
+            self.output_counts[self.query_slot] = self.count
+
+        @pl.when(self.live_tiles < tiles)
+        def pad_after_draining():
+            @pl.when(self.live_tiles > 0)
+            def finish():
+                self.publish(self.live_tiles - 1, wait=True)
+
+                @pl.when(self.live_tiles > 1)
+                def previous():
+                    self.publish(self.live_tiles - 2, wait=True)
+
+            self.fill_padding()
 
     def qk(self, tile, fragment: int) -> jax.Array:
         query = self.lhs
@@ -412,20 +592,27 @@ def _kernel(
     pool,
     page_table,
     q_scale,
+    candidate_pages,
     out,
     queries,
     prepared_queries,
     keys,
     scores,
+    compact_scores,
     output_counts,
     pages,
     read_sem,
     write_sem,
     q_sem,
     page_sem,
+    packing,
+    packing_bounds,
+    packing_bounds_smem,
+    packing_sem,
     *,
     pipeline,
     skip_invalid_pages,
+    candidate_block_size,
 ):
     def make_ops(state):
         return MQAOps(
@@ -439,16 +626,27 @@ def _kernel(
             pltpu.annotate(page_table, no_store=True),
             pltpu.annotate(q_scale, no_store=True),
             out,
+            (
+                pltpu.annotate(candidate_pages, no_store=True)
+                if candidate_pages is not None
+                else None
+            ),
+            candidate_block_size,
             queries,
             prepared_queries,
             pltpu.annotate(keys, no_store=True),
             scores,
+            compact_scores,
             output_counts,
             pages,
             read_sem,
             write_sem,
             q_sem,
             page_sem,
+            packing,
+            packing_bounds,
+            packing_bounds_smem,
+            packing_sem,
             skip_invalid_pages,
         )
 
@@ -461,7 +659,7 @@ def _kernel(
 
 @functools.partial(
     jax.jit,
-    static_argnames=("cache_layout", "skip_invalid_pages"),
+    static_argnames=("cache_layout", "skip_invalid_pages", "candidate_block_size"),
 )
 def packed_fp8_mqa_logits(
     q: jax.Array,
@@ -474,6 +672,8 @@ def packed_fp8_mqa_logits(
     q_scale: jax.Array,
     cache_layout: PackedFP8Layout | None = None,
     skip_invalid_pages: bool = False,
+    candidate_layout: CandidateLayout | None = None,
+    candidate_block_size: int = 1,
 ) -> jax.Array:
     """Return FP32 logits [T, P*128] from transposed packed FP8 pages.
 
@@ -493,6 +693,9 @@ def packed_fp8_mqa_logits(
         skip_invalid_pages: Sparse task tables skip invalid page DMAs and wait
             for only the issued bytes. Empty tiles skip arithmetic. Padded
             fragments inside nonempty tiles are computed and masked at output.
+        candidate_layout: Canonical [T,C] block IDs and page-local permutations.
+            When supplied, only [T,C*candidate_block_size] scores leave VMEM.
+        candidate_block_size: Tokens per candidate block.
 
     QK accumulates in FP32 then rounds to BF16. ReLU, folded Q weights and
     weighted products use BF16. Head sums accumulate in FP32, round to BF16,
@@ -503,6 +706,20 @@ def packed_fp8_mqa_logits(
     banks = pool if isinstance(pool, tuple) else (pool,)
     key_groups, page_count = block_table.shape
     width = page_count * PAGE_RECORDS
+    output_width = width
+    if candidate_layout is not None:
+        candidate_blocks = candidate_layout.blocks
+        if (
+            candidate_blocks.ndim != 2
+            or candidate_blocks.shape[0] != tokens
+            or candidate_blocks.dtype != jnp.int32
+            or candidate_block_size < 1
+            or candidate_layout.pages.shape
+            != (PagePacking(candidate_block_size).fields, tokens, page_count)
+            or candidate_layout.pages.dtype != jnp.int32
+        ):
+            raise ValueError("Expected int32 candidate blocks [T,C] and positive size")
+        output_width = candidate_blocks.shape[1] * candidate_block_size
     config = PACKED_FP8_MQA_CONFIG
     if (
         (heads, dim) != (32, DIM)
@@ -528,8 +745,8 @@ def packed_fp8_mqa_logits(
         raise ValueError(
             "Expected FP8 Q[T,32,128], FP32 weights/scales and packed K pages"
         )
-    if tokens == 0 or width == 0:
-        return jnp.empty((tokens, width), jnp.float32)
+    if tokens == 0 or width == 0 or output_width == 0:
+        return jnp.full((tokens, output_width), -jnp.inf, jnp.float32)
     if tokens < config.query_tile or width % config.key_tile:
         raise ValueError(
             "Expected at least six Q rows and context capacity divisible by 32768"
@@ -542,7 +759,17 @@ def packed_fp8_mqa_logits(
             "Packed FP8 MQA currently targets TPU v7 with two MXUs"
         )
     key_tile = config.key_tile
-    plan = BufferPlan(config, heads, page_count, info.mxu_column_size, q.dtype)
+    plan = BufferPlan(
+        config,
+        heads,
+        page_count,
+        info.mxu_column_size,
+        q.dtype,
+        pl.cdiv(output_width, PAGE_RECORDS) * PAGE_RECORDS
+        if candidate_layout is not None
+        else 0,
+        candidate_block_size,
+    )
     plan.validate(info, tokens, key_groups)
     # Prepare once for all Q blocks. The data representation and bytes copied
     # are unchanged; validity and the selected bank are retained in two bits.
@@ -572,9 +799,14 @@ def packed_fp8_mqa_logits(
 
     return pl.pallas_call(
         functools.partial(
-            _kernel, pipeline=pipeline, skip_invalid_pages=skip_invalid_pages
+            _kernel,
+            pipeline=pipeline,
+            skip_invalid_pages=skip_invalid_pages,
+            candidate_block_size=candidate_block_size,
         ),
-        out_shape=jax.ShapeDtypeStruct((tokens, width), jnp.float32),
+        out_shape=jax.ShapeDtypeStruct(
+            (tokens, plan.candidate_width or output_width), jnp.float32
+        ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=3,
             grid=(1,),
@@ -584,6 +816,9 @@ def packed_fp8_mqa_logits(
                 tuple(hbm for _ in banks),
                 pl.BlockSpec(memory_space=pltpu.VMEM),
                 pl.BlockSpec(memory_space=pltpu.VMEM),
+                pl.BlockSpec(memory_space=pltpu.VMEM)
+                if candidate_layout is not None
+                else None,
             ),
             out_specs=hbm,
             scratch_shapes=plan.scratch_shapes(),
@@ -593,7 +828,11 @@ def packed_fp8_mqa_logits(
             vmem_limit_bytes=info.vmem_capacity_bytes,
             disable_bounds_checks=True,
         ),
-        name="paged_mqa_full_packed_fp8",
+        name=(
+            "paged_mqa_compact_packed_fp8"
+            if candidate_layout is not None
+            else "paged_mqa_full_packed_fp8"
+        ),
     )(
         query_start_loc,
         lengths,
@@ -603,4 +842,5 @@ def packed_fp8_mqa_logits(
         banks,
         block_table,
         q_scale,
-    )
+        candidate_layout.pages if candidate_layout is not None else None,
+    )[:, :output_width]

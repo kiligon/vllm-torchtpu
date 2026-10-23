@@ -67,35 +67,31 @@ def load_model():
 
 def load_sparse_baseline(source: Path):
     """Load historical scorer sources supplied for an exact FP8 A/B."""
-    modules = []
-    for suffix in (
-        "kernels.deepseek_v41.index_selection._packed_fp8_pipeline",
-        "kernels.deepseek_v41.index_selection.packed_fp8_mqa",
-        "kernels.deepseek_v41.index_selection.packed_fp8_sparse",
-        "models.vllm.deepseek_v41.v2.packed_fp8_indexer",
-    ):
-        name = "vllm_torchtpu." + suffix
-        path = source / "src" / (name.replace(".", "/") + ".py")
-        spec = importlib.util.spec_from_file_location(name + "_baseline", path)
-        assert spec is not None and spec.loader is not None
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[spec.name] = module
-        spec.loader.exec_module(module)
-        modules.append(module)
-    pipeline, scorer, sparse, indexer = modules
-    scorer.BufferPlan = pipeline.BufferPlan
-    scorer.Pipeline = pipeline.Pipeline
-    scorer.QueryState = pipeline.QueryState
-    scorer.QueryTile = pipeline.QueryTile
-    indexer.packed_fp8_mqa_logits = scorer.packed_fp8_mqa_logits
-    indexer.candidate_pages = sparse.candidate_pages
-    indexer.mask_candidate_scores = sparse.mask_candidate_scores
-    if hasattr(sparse, "packed_fp8_sparse_mqa_logits"):
-        sparse.packed_fp8_mqa_logits = scorer.packed_fp8_mqa_logits
-        indexer.packed_fp8_sparse_mqa_logits = sparse.packed_fp8_sparse_mqa_logits
-    if hasattr(sparse, "packed_fp8_sparse_mqa_topk"):
-        indexer.packed_fp8_sparse_mqa_topk = sparse.packed_fp8_sparse_mqa_topk
-    return indexer
+    originals = {}
+    try:
+        for suffix in (
+            "kernels.deepseek_v41.index_selection._packed_fp8_compact",
+            "kernels.deepseek_v41.index_selection._packed_fp8_select",
+            "kernels.deepseek_v41.index_selection._packed_fp8_pipeline",
+            "kernels.deepseek_v41.index_selection.packed_fp8_mqa",
+            "kernels.deepseek_v41.index_selection.packed_fp8_sparse",
+            "models.vllm.deepseek_v41.v2.packed_fp8_indexer",
+        ):
+            name = "vllm_torchtpu." + suffix
+            path = source / "src" / (name.replace(".", "/") + ".py")
+            spec = importlib.util.spec_from_file_location(name + "_baseline", path)
+            assert spec is not None and spec.loader is not None
+            module = importlib.util.module_from_spec(spec)
+            originals[name] = sys.modules.get(name)
+            sys.modules[spec.name] = sys.modules[name] = module
+            spec.loader.exec_module(module)
+        return module
+    finally:
+        for name, original in originals.items():
+            if original is None:
+                del sys.modules[name]
+            else:
+                sys.modules[name] = original
 
 
 def round_fp8(values):
@@ -279,6 +275,19 @@ def compile_arm(modules, variant, mode, requests, queries, width, out):
     else:
         compiled = compile_run()
     (out / f"{variant}_{mode}.hlo.txt").write_text(compiled.as_text())
+    memory = compiled.memory_analysis()
+    assert memory is not None
+    (out / f"{variant}_{mode}.memory.json").write_text(
+        json.dumps(
+            dict(
+                argument_bytes=memory.argument_size_in_bytes,
+                output_bytes=memory.output_size_in_bytes,
+                alias_bytes=memory.alias_size_in_bytes,
+                temporary_bytes=memory.temp_size_in_bytes,
+            ),
+            indent=2,
+        )
+    )
     print(
         json.dumps(dict(compiled=run.__name__, seconds=time.monotonic() - started)),
         flush=True,

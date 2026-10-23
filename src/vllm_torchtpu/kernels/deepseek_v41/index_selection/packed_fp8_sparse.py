@@ -8,8 +8,8 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 
-from ._packed_fp8_compact import candidate_membership, compact_candidate_scores
-from ._packed_fp8_select import select_candidate_scores
+from ._packed_fp8_compact import candidate_membership, candidate_topk
+from ._packed_fp8_packing import candidate_layout
 from .packed_fp8_cache import PAGE_RECORDS, PackedFP8Layout
 from .packed_fp8_mqa import packed_fp8_mqa_logits
 from .tuned_block_sizes import PACKED_FP8_MQA_CONFIG
@@ -41,79 +41,9 @@ def packed_fp8_sparse_mqa_logits(
 
     Queries are grouped by request. Token column j maps to
     ``canonical[row,j // block_size] * block_size + j % block_size``.
-    Invalid or invisible columns are -inf. TensorCore scoring currently uses
-    full-context HBM scratch, then SparseCore gathers only candidate columns.
+    Invalid or invisible columns are -inf. Scores are packed in TensorCore VMEM
+    before writing the candidate-width output to HBM.
     """
-    scores, canonical = _sparse_mqa_scores(
-        q,
-        weights,
-        pool,
-        page_table,
-        lengths,
-        requests,
-        candidates,
-        query_start_loc,
-        q_scale=q_scale,
-        cache_layout=cache_layout,
-        block_size=block_size,
-    )
-    return compact_candidate_scores(scores, canonical, block_size=block_size), canonical
-
-
-def packed_fp8_sparse_mqa_topk(
-    q: jax.Array,
-    weights: jax.Array,
-    pool: jax.Array | tuple[jax.Array, jax.Array],
-    page_table: jax.Array,
-    lengths: jax.Array,
-    requests: jax.Array,
-    candidates: jax.Array,
-    query_start_loc: jax.Array,
-    *,
-    k: int,
-    q_scale: jax.Array,
-    cache_layout: PackedFP8Layout,
-    block_size: int,
-) -> tuple[jax.Array, jax.Array]:
-    """Return ascending logical TopK IDs, -1 padded, and canonical block IDs.
-
-    Selection gathers only candidate scores in SparseCore VMEM; compact logits
-    need not be written to HBM. TensorCore's full-context scratch remains.
-    """
-    scores, canonical = _sparse_mqa_scores(
-        q,
-        weights,
-        pool,
-        page_table,
-        lengths,
-        requests,
-        candidates,
-        query_start_loc,
-        q_scale=q_scale,
-        cache_layout=cache_layout,
-        block_size=block_size,
-    )
-    k = min(k, canonical.shape[1] * block_size)
-    return select_candidate_scores(
-        scores, canonical, k=k, block_size=block_size
-    ), canonical
-
-
-def _sparse_mqa_scores(
-    q: jax.Array,
-    weights: jax.Array,
-    pool: jax.Array | tuple[jax.Array, jax.Array],
-    page_table: jax.Array,
-    lengths: jax.Array,
-    requests: jax.Array,
-    candidates: jax.Array,
-    query_start_loc: jax.Array,
-    *,
-    q_scale: jax.Array,
-    cache_layout: PackedFP8Layout,
-    block_size: int,
-) -> tuple[jax.Array, jax.Array]:
-    """Score candidate pages into logical-position scratch shared by epilogues."""
     tasks = candidate_pages(
         candidates,
         lengths,
@@ -133,8 +63,51 @@ def _sparse_mqa_scores(
         q_scale=q_scale,
         cache_layout=cache_layout,
         skip_invalid_pages=True,
+        candidate_layout=candidate_layout(
+            tasks.candidates,
+            tasks.block_mask,
+            block_size=block_size,
+            pages=tasks.physical.shape[1],
+        ),
+        candidate_block_size=block_size,
     )
     return scores, tasks.candidates
+
+
+def packed_fp8_sparse_mqa_topk(
+    q: jax.Array,
+    weights: jax.Array,
+    pool: jax.Array | tuple[jax.Array, jax.Array],
+    page_table: jax.Array,
+    lengths: jax.Array,
+    requests: jax.Array,
+    candidates: jax.Array,
+    query_start_loc: jax.Array,
+    *,
+    k: int,
+    q_scale: jax.Array,
+    cache_layout: PackedFP8Layout,
+    block_size: int,
+) -> tuple[jax.Array, jax.Array]:
+    """Return ascending logical TopK IDs, -1 padded, and canonical block IDs.
+
+    SparseCore selects directly from TensorCore's compact candidate scores.
+    """
+    scores, canonical = packed_fp8_sparse_mqa_logits(
+        q,
+        weights,
+        pool,
+        page_table,
+        lengths,
+        requests,
+        candidates,
+        query_start_loc,
+        q_scale=q_scale,
+        cache_layout=cache_layout,
+        block_size=block_size,
+    )
+    k = min(k, canonical.shape[1] * block_size)
+    return candidate_topk(scores, canonical, k=k, block_size=block_size), canonical
 
 
 def candidate_pages(

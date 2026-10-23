@@ -144,6 +144,8 @@ def _routing_scorer(
     q_scale,
     cache_layout,
     skip_invalid_pages=False,
+    candidate_layout=None,
+    candidate_block_size=1,
 ):
     """Test grouping and page interpretation; does not emulate TPU arithmetic."""
     from vllm_torchtpu.kernels.deepseek_v41.index_selection.packed_fp8_cache import (
@@ -159,6 +161,13 @@ def _routing_scorer(
         owners, :, 0
     ].astype(jnp.float32) + weights[:, :1]
     scores = jnp.where(jnp.arange(256)[None, :] < lengths[:, None], scores, -jnp.inf)
+    if candidate_layout is not None:
+        logical = (
+            candidate_layout.blocks[:, :, None] * candidate_block_size
+            + jnp.arange(candidate_block_size)
+        ).reshape(q.shape[0], -1)
+        selected = jnp.take_along_axis(scores, jnp.clip(logical, 0, 255), axis=1)
+        return jnp.where((logical >= 0) & (logical < 256), selected, -jnp.inf)
     return jnp.pad(
         scores, ((0, 0), (0, pages.shape[1] * 128 - 256)), constant_values=-jnp.inf
     )

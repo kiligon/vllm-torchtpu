@@ -45,14 +45,17 @@ Candidate consumers mark pages needed by each group of at most six queries from
 the same request. Page slots retain their original logical positions; unused
 pages are marked `-1`. Only valid pages issue HBM DMAs, and the receive wait counts
 only the bytes actually requested. SparseCore builds unique, ascending candidate
-block IDs and gathers their scores before top-k. The public sparse entry point,
+block IDs. Page metadata records the compact output offset, count and inverse
+permutation. TensorCore gathers scores within each 128-token page, writes them
+into aligned compact VMEM windows, and transfers only the compact result to HBM.
+The public sparse entry point,
 `packed_fp8_sparse_mqa_logits`, returns `[queries, candidate_blocks * block_size]`
 FP32 scores and their canonical block IDs. For 2048 eight-token blocks this is
 16384 columns. Top-k maps compact column indices back to logical token IDs;
 duplicate candidate IDs do not duplicate tokens in the result.
 The model's unordered selection uses `packed_fp8_sparse_mqa_topk`: the same
-16K candidate scores stay in SparseCore VMEM through selection, and only logical
-TopK IDs are written back. Ordered selection retains the compact-logit route.
+16K candidate scores are read directly by SparseCore for selection, and only
+logical TopK IDs are written back. Ordered selection uses the same compact logits.
 Candidate publishers still score the full visible context. The whole-batch
 short-context bypass and the existing all-blocks-fit identity are preserved.
 
@@ -63,9 +66,10 @@ every page still read every page. The arithmetic pipeline retains its unrolled
 logical page positions can compute more tiles than compacting selected pages;
 the change removes metadata overhead while retaining the compute pipeline.
 Entirely empty tiles skip arithmetic; partial tiles retain their unrolled
-compute. TensorCore still writes a full-context temporary score array, which
-SparseCore reads to produce the compact result. The public output shape does
-not imply that this temporary or all extra arithmetic has been eliminated.
+compute. Candidate consumers allocate one 32K VMEM score tile and two compact
+VMEM output buffers. They allocate no full-context HBM score array and need no
+separate full-width gather. For 2048 eight-token candidates at 96K context, the
+FP32 score output is 64 KiB per query instead of 384 KiB.
 Sparse calls leave skipped K pages unwritten and allocate no zero buffer.
 QK and both head-reduction paths operate independently on each token column;
 invalid pages are masked to `-inf` before top-k or any cross-token operation.
@@ -85,9 +89,9 @@ not exercise the optimized kernel.
 Local integration checks cover incremental writes, shared ownership, empty
 deferred writes, candidate publication/filtering, ragged query order, and the
 Torch wrapper's dispatch arguments. CPU routing tests replace the TPU scorer
-with a stand-in and are not numerical validation of the kernel. A local
-sim-pjrt compile passed for the complete JAX two-bank writer, native-page
-scorer, candidate-page preparation and SparseCore top-k path at P-state 7.
+with a stand-in and are not numerical validation of the kernel. The earlier full-context-scratch route passed a sim-pjrt compile for the
+complete JAX two-bank writer, native-page scorer, candidate-page preparation
+and SparseCore top-k path at P-state 7.
 Metadata tests compare page coverage, per-query masks and logical top-k IDs with
 a token-level reference, including page holes, duplicates, empty candidates and
 blocks crossing physical page boundaries. DMA descriptor tests verify that
@@ -160,6 +164,7 @@ call.
 | `_packed_fp8_write.py` | Grouped page read/modify/write with batched DMA |
 | `packed_fp8_mqa.py` | Public API, metadata preparation, per-query operations and DMA descriptors |
 | `packed_fp8_sparse.py` | Candidate page validity and per-query block masks |
+| `_packed_fp8_packing.py` | Page-local candidate permutations and compact output offsets |
 | `_packed_fp8_math.py` | Head permutation and BF16 products / FP32 head accumulation |
 | `_packed_fp8_pipeline.py` | Buffer allocation, fragment schedule and DMA ownership |
 | `tuned_block_sizes.py:PACKED_FP8_MQA_CONFIG` | Measured static policy |
@@ -172,11 +177,16 @@ QK issue, older-fragment reduction/store, second next-page DMA. Extracting Pytho
 helpers is safe only when the generated code is checked.
 
 Q has two buffers. Page metadata has four buffers with two-query lookahead.
-Output has two tile buffers per query parity (four total), allowing the final
-output transfers of Q block n to overlap Q block n+1. Reusing a parity waits for
-its recorded rows first; kernel exit drains both parities. Short-context padding
-first drains the current outputs. These extra buffers are VMEM/SMEM buffers,
-not additional HBM banks.
+Dense output has two tile buffers per query parity (four total). Candidate
+output reuses one compute tile and has one compact buffer per query parity.
+Compact packing uses runtime loops over source pages and destination windows;
+it does not unroll the 2048 candidate blocks. The destination range covers all
+six query rows, so rows with different output offsets can cause empty masked
+stores. Static bundle counts alone do not bound this runtime overhead.
+The final output transfers of Q block n overlap Q block n+1. Reusing a parity
+waits for its recorded rows first; kernel exit drains both parities. Dense
+short-context padding first drains the current outputs. These extra buffers
+are VMEM/SMEM buffers, not additional HBM banks.
 
 Head order arranges four queries in the first 128 rows and two in the last 64.
 Odd fragments before the final eight use an MXU selector reduction; other
@@ -241,8 +251,9 @@ Assembly-verified selected paths, including branch delay slots:
 | Masked tile, no prefetch | 3998 | 3998 |
 
 These compute bodies contain no DMA waits; the two prefetch bodies contain no
-internal control-flow branches. Sparse calls have the same explicit scratch
-buffers as dense calls, with no K zero-initialization or VMEM copy loops.
+internal control-flow branches. In that revision, sparse calls had the same
+explicit scratch buffers as dense calls, with no K zero-initialization or VMEM
+copy loops.
 The entire sparse kernel contains 17,536 static bundles; the dense kernel still
 matches the measured baseline's 17,545 bundles instruction-for-instruction
 after debug normalization. Static totals include mutually exclusive paths and
@@ -427,10 +438,42 @@ projections, RoPE, Torch dispatch and TP collectives.
 
 Use `bench_packed_fp8_layer.py --sparse-baseline <baseline-checkout> --profile
 --out <dir>` for the same-run comparison. The baseline checkout must contain
-the historical full-width scorer, pipeline, candidate metadata and model entry
-point. The current benchmark loads all four together to avoid mixing variants.
+the historical full-width scorer, pipeline, candidate metadata, selection helpers
+and model entry point. The benchmark loads these dependencies together to avoid
+mixing variants.
 
 ## Reproduce
+
+The independent dense copy in `packed_fp8_dense.py` starts from commit
+`842880870`. Its `packed_fp8_paged_mqa_logits` entry follows vLLM's Blackwell
+row/request contract: Q `[T,32,128]`, page tables `[T,P]`, context lengths
+`[T]`, and request IDs `indices[T]`. Consecutive queries with the same request
+ID share a page-table row inside the kernel. The required static `query_size`
+comes from the model's configured decode width: `num_speculative_tokens + 1`,
+or 1 without speculation. The tile size is `min(query_size, 8)`; longer runs
+are split at that boundary. Buffers and head reductions follow this size.
+The caller supplies identical page-table rows for queries of one request.
+The kernel prefetches only the first page-table row of each Q tile, encodes it
+once, and shares it across that tile's queries. Four staging rows replace the
+resident full-batch encoded table. Each query retains its own history length.
+Q scales are `[T,32]`; the singleton axes of the GPU API are omitted.
+No candidate list, candidate-page union, or compact-score packing is involved.
+
+Output is FP32 `[T,max_model_len]` in logical token order, with invalid positions
+set to `-inf`. This preserves the TPU FP8 cache layout and arithmetic; it does
+not adopt NVIDIA's MXFP4 bytes or BF16 output. Physical page-table capacity must
+cover `max_model_len` rounded up to 32768 tokens. The dense copy is available for
+independent validation; model dispatch still uses the existing implementation.
+Use `bench_packed_fp8_mqa.py --variant per-query --out <dir>` to benchmark it,
+or add `--compile-only` to compile without execution. Benchmark page-table
+expansion happens before the timed call. This homogeneous benchmark supplies
+its fixture's six queries per request; the kernel has no six-query default.
+
+Use `--variant compare` for an interleaved grouped/per-query A/B on the same
+device. Both seeds must produce bitwise-identical FP32 scores before timing.
+The benchmark saves each variant's HLO and memory sizes alongside raw XProf
+samples. To compare against a historical grouped implementation, apply only
+the dense copy and benchmark changes on that exact baseline checkout.
 
 ```bash
 # Layout tests can run on CPU.
@@ -442,5 +485,6 @@ python scripts/dsv41_bench/bench_packed_fp8_mqa.py --out /tmp/packed-fp8-mqa
 ```
 
 The maintained benchmark imports the source directly and needs no experiment
-source directory. It reports timing only (`correctness: null`). Use
+source directory. Single-variant runs report timing only (`correctness: null`);
+`--variant compare` verifies bitwise parity. Use
 `--compile-only` under sim-pjrt to compile the fixed shape without device data.
