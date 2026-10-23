@@ -34,6 +34,7 @@ pytestmark = [
     pytest.mark.nightly,
     pytest.mark.omni,
     pytest.mark.spawns_tpu_workers,
+    pytest.mark.multichip,
 ]
 
 RING_UNSUPPORTED = (
@@ -46,18 +47,8 @@ CASES = [
     (WAN2_1_T2V_1_3B, {"cfg_parallel_size": 2}, "cfg2", ()),
     (WAN2_1_T2V_1_3B, {"ulysses_degree": 2}, "u2", ()),
     (WAN2_1_T2V_1_3B, {"tensor_parallel_size": 2}, "tp2", ()),
-    (
-        WAN2_1_T2V_14B,
-        {"cfg_parallel_size": 2, "ulysses_degree": 4},
-        "cfg2xu4",
-        pytest.mark.multichip,
-    ),
-    (
-        WAN2_1_T2V_14B,
-        {"ulysses_degree": 8},
-        "u8",
-        pytest.mark.multichip,
-    ),
+    (WAN2_1_T2V_14B, {"cfg_parallel_size": 2, "ulysses_degree": 4}, "cfg2xu4", ()),
+    (WAN2_1_T2V_14B, {"ulysses_degree": 8}, "u8", ()),
     (
         WAN2_1_T2V_1_3B,
         {"ring_degree": 2},
