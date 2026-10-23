@@ -109,7 +109,11 @@ class VllmCompressedTensorsMoEMethod(CompressedTensorsMoEMethod):
         # 3. Dispatch FP8 MoE
         if _is_weight_fp8(weight_quant):
             fp8_config = _build_fp8_config(weight_quant, input_quant)
-            return VllmFp8MoEMethodTPU(fp8_config, fp8_config.get_moe_config(layer))
+            method = VllmFp8MoEMethodTPU(fp8_config, fp8_config.get_moe_config(layer))
+            # compressed-tensors names every scale `weight_scale`; Fp8MoEMethod
+            # defaults block scales to DeepSeek's `weight_scale_inv`.
+            method.weight_scale_name = "weight_scale"
+            return method
         # Fallback
         raise RuntimeError(
             f"Unsupported TPU FusedMoe scheme: {weight_quant}, {input_quant}"
