@@ -520,9 +520,10 @@ def test_wan_self_attention_patch_falls_back_on_f32():
     apply_omni_model_specific_patches()
     attn = _make_wan_self_attention()
     x = torch.ones(1, 3, 64)
+    rot = (torch.ones(1, 3, 1, 64), torch.ones(1, 3, 1, 64))
     torch.testing.assert_close(
-        attn(x),
-        WanSelfAttention._tpu_orig_forward(attn, x),
+        attn(x, rot),
+        WanSelfAttention._tpu_orig_forward(attn, x, rot),
         rtol=0,
         atol=0,
     )
