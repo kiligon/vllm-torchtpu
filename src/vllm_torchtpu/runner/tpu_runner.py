@@ -7876,8 +7876,10 @@ class TPUModelRunner(GPUModelRunner):
     def compute_selected_top_tokens(
         self, hidden_states: torch.Tensor, indices_do_sample: torch.Tensor
     ) -> torch.Tensor:
+        # Callers gate on _greedy_top_tokens_this_step, so this only narrows the
+        # type; a missing head owner is object state, hence RuntimeError.
         if self._greedy_head_owner is None:
-            raise ValueError("greedy top-token path requires a greedy head owner")
+            raise RuntimeError("greedy top-token path requires a greedy head owner")
         selected = torch.index_select(hidden_states, 0, indices_do_sample)
         return greedy_top_tokens.top_tokens(self._greedy_head_owner, selected)
 
@@ -7885,8 +7887,10 @@ class TPUModelRunner(GPUModelRunner):
     def compute_top_tokens_from_hidden_states(
         self, hidden_states: torch.Tensor
     ) -> torch.Tensor:
+        # Callers gate on _greedy_top_tokens_this_step, so this only narrows the
+        # type; a missing head owner is object state, hence RuntimeError.
         if self._greedy_head_owner is None:
-            raise ValueError("greedy top-token path requires a greedy head owner")
+            raise RuntimeError("greedy top-token path requires a greedy head owner")
         return greedy_top_tokens.top_tokens(self._greedy_head_owner, hidden_states)
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
