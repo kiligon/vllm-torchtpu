@@ -135,7 +135,7 @@ def test_rope_patch_installed():
 
 def test_rope_patch_accepts_token_major_tables():
     # vLLM-Omni 0.32 (vllm-omni#8112): LingBot-World passes (tokens, D/2) tables.
-    rope = _MockRotaryEmbeddingWan(is_neox_style=False, half_head_dim=True)
+    rope = RotaryEmbeddingWan(is_neox_style=False, half_head_dim=True)
     x = torch.randn(1, 4, 2, 8, dtype=torch.bfloat16)
     cos = torch.randn(4, 4, dtype=torch.bfloat16)
     sin = torch.randn(4, 4, dtype=torch.bfloat16)
