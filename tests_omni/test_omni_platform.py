@@ -397,10 +397,18 @@ def test_qwen_image_rope_txt_freqs_clone(rope_cls_name):
     assert vid_freqs.shape == (4, 64)
 
 
-def test_safe_pack_tensor_if_large():
+@pytest.mark.parametrize(
+    "nbytes",
+    [1, 1 << 20],
+    ids=["lt_1mb", "gt_1mb"],
+)
+def test_safe_pack_tensor_if_large(monkeypatch, nbytes):
     apply_omni_model_specific_patches()
+    # Return the tensor that would be copied to SHM, so that the test sees
+    # what the original function received for tensors above the threshold.
+    monkeypatch.setattr(ipc, "_tensor_to_shm", lambda val, **kwargs: val)
 
-    cpu_tensor = torch.empty(1, device="cpu")
+    cpu_tensor = torch.empty(nbytes, dtype=torch.uint8, device="cpu")
     tpu_tensor = MagicMock()
     tpu_tensor.cpu.return_value = cpu_tensor
     created = []
