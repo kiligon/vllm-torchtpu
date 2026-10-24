@@ -11,14 +11,24 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Generic raw-pool layout and paged cache configuration (`pool`).
+"""Generic raw-pool layout, packing, and Pallas gather kernel.
 
-Framework-free (jax + numpy only): `PoolLayout` defines the byte layout of the
-raw pools and `CacheExec` / `PoolBackend` hold the paged-pool execution settings.
+Framework-free (jax + numpy only) and model-agnostic: everything is driven by a
+`PoolLayout` (see `pool/layout.py`). Models build their layout and wrap it in a
+`PoolBackend` with `make_pool_backend(layout)`. Paged execution settings are
+the `CacheExec` extension of `ExecSpec` (`pool/config.py`).
 """
 
 from __future__ import annotations
 
+from .backend import (
+    GATHER_KERNEL_NAME,
+    POOL_KERNEL_NAMES,
+    SCATTER_KERNEL_NAME,
+    can_pool_gather,
+    check_ckpt_bounds,
+    make_pool_backend,
+)
 from .config import (
     ACT_MODE_VALUES,
     DEFAULT_CACHE_EXEC,
@@ -31,18 +41,46 @@ from .config import (
     resolved_max_pages_per_seq,
     with_cache,
 )
+from .gather import gather_gdn_states
 from .layout import PoolLayout
+from .pack import (
+    allocate_test_layout,
+    conv_to_raw_page,
+    kv_to_raw_page,
+    pool_to_states,
+    raw_page_to_conv,
+    raw_page_to_kv,
+    raw_pages_to_ssm,
+    ssm_to_raw_pages,
+    states_to_pool,
+)
 
 __all__ = [
     "ACT_MODE_VALUES",
     "DEFAULT_CACHE_EXEC",
+    "GATHER_KERNEL_NAME",
     "POOL_GATHER_VALUES",
     "POOL_IO_NUMERICS",
     "POOL_STATE_NAME",
     "CacheExec",
     "PoolBackend",
-    "PoolLayout",
     "cache_exec",
     "resolved_max_pages_per_seq",
     "with_cache",
+    "POOL_KERNEL_NAMES",
+    "SCATTER_KERNEL_NAME",
+    "PoolLayout",
+    "allocate_test_layout",
+    "can_pool_gather",
+    "check_ckpt_bounds",
+    "conv_to_raw_page",
+    "gather_gdn_states",
+    "kv_to_raw_page",
+    "make_pool_backend",
+    "pool_to_states",
+    "raw_page_to_conv",
+    "raw_page_to_kv",
+    "raw_pages_to_ssm",
+    "ssm_to_raw_pages",
+    "states_to_pool",
 ]
