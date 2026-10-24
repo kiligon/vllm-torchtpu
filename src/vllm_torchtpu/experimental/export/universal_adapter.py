@@ -38,6 +38,26 @@ from vllm_torchtpu.experimental.export.trace import trace
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 
 
+
+# The vLLM TPU runner's smallest request padding (`tpu_runner.MIN_NUM_SEQS`).
+_MIN_REQ_BUCKET = 8
+
+
+def default_req_buckets(max_num_seqs: int) -> tuple[int, ...]:
+    """Request buckets as the vLLM TPU runner pads `num_reqs` (`_get_req_paddings`).
+
+    Powers of two from 8 up to, and always ending with, `max_num_seqs`, so a batch is padded
+    to at most twice its size. A fixed list with a jump to `max_num_seqs` (8, 16, 32, 64, 512)
+    would run the LM head and the sampler on 512 rows for any batch above 64.
+    """
+    buckets = []
+    size = _MIN_REQ_BUCKET
+    while size < max_num_seqs:
+        buckets.append(size)
+        size *= 2
+    buckets.append(max_num_seqs)
+    return tuple(buckets)
+
 def make_attention_metadata(
     *,
     input_positions: Any,
@@ -262,11 +282,7 @@ def build_export_config_from_vllm(
         token_buckets = tuple(int(b) for b in token_buckets)
 
     if req_buckets is None:
-        default_reqs = [8, 16, 32, 64]
-        filtered = [r for r in default_reqs if r <= max_num_seqs]
-        if not filtered or filtered[-1] != max_num_seqs:
-            filtered.append(max_num_seqs)
-        req_buckets = tuple(sorted(set(filtered)))
+        req_buckets = default_req_buckets(max_num_seqs)
     else:
         req_buckets = tuple(int(r) for r in req_buckets)
 

@@ -1529,3 +1529,18 @@ def test_forward_binds_weights_held_outside_the_module_tree() -> None:
         assert wrapper.model.experts.router.bias is original
         assert "bias" in wrapper.model.gate._parameters
     assert torch.equal(original, torch.zeros(4))
+
+
+@pytest.mark.parametrize(
+    "max_num_seqs,expected",
+    [
+        (512, (8, 16, 32, 64, 128, 256, 512)),
+        (300, (8, 16, 32, 64, 128, 256, 300)),
+        (8, (8,)),
+        (4, (4,)),
+    ],
+)
+def test_default_req_buckets_pad_like_the_vllm_runner(
+    max_num_seqs: int, expected: tuple[int, ...]
+) -> None:
+    assert universal_adapter.default_req_buckets(max_num_seqs) == expected
