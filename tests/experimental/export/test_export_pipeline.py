@@ -568,6 +568,7 @@ def single_rank_tp_group() -> Any:
 def test_universal_adapter_1d_and_2d_mrope_export_and_cli(tmp_path) -> None:
     hf_dir = tmp_path / "hf_ckpt"
     hf_dir.mkdir()
+    (hf_dir / "tokenizer.json").write_text(json.dumps({"version": "1.0"}))
     with open(hf_dir / "config.json", "w") as f:
         json.dump(
             {
@@ -771,6 +772,7 @@ def test_generation_config_is_not_declared_when_the_checkpoint_has_none(
     hf_dir = tmp_path / "hf_ckpt"
     hf_dir.mkdir()
     (hf_dir / "config.json").write_text(json.dumps({"eos_token_id": 2}))
+    (hf_dir / "tokenizer.json").write_text(json.dumps({"version": "1.0"}))
     out_dir = tmp_path / "artifact"
     out_dir.mkdir()
     cfg = api.TextOnlyLLMExportConfig(
@@ -880,11 +882,15 @@ def test_params_read_by_forward_drops_unread_forward_weights() -> None:
 def test_resolve_hf_checkpoint_dir_uses_cached_hub_snapshot(tmp_path: Path) -> None:
     snapshot = tmp_path / "snapshots" / "main"
     snapshot.mkdir(parents=True)
+    fetched = []
 
-    def fake_cached_file(repo: str, filename: str, **kwargs: Any) -> str:
-        assert kwargs["local_files_only"] is True
+    def fake_cached_file(repo: str, filename: str, **kwargs: Any) -> str | None:
         if repo != "org/tiny":
-            raise OSError(f"{repo} is not cached")
+            raise OSError(f"{repo} is not on the Hub")
+        fetched.append((filename, kwargs.get("local_files_only", False)))
+        if filename == "generation_config.json":
+            assert kwargs["_raise_exceptions_for_missing_entries"] is False
+            return None
         return str(snapshot / filename)
 
     resolve = universal_adapter.resolve_hf_checkpoint_dir
@@ -894,6 +900,26 @@ def test_resolve_hf_checkpoint_dir_uses_cached_hub_snapshot(tmp_path: Path) -> N
         assert resolve("org/tiny") == str(snapshot)
         with pytest.raises(FileNotFoundError, match="org/missing"):
             resolve("org/missing")
+    # The companion files are fetched, not only looked up in the cache: a dummy
+    # weight load caches config.json alone.
+    assert fetched == [
+        ("config.json", False),
+        ("tokenizer.json", False),
+        ("generation_config.json", False),
+    ]
+
+
+def test_companion_files_require_a_tokenizer(tmp_path: Path) -> None:
+    hf_dir = tmp_path / "hf_ckpt"
+    hf_dir.mkdir()
+    (hf_dir / "config.json").write_text(json.dumps({"eos_token_id": 2}))
+    out_dir = tmp_path / "artifact"
+    out_dir.mkdir()
+    cfg = api.TextOnlyLLMExportConfig(
+        model_name="tiny", vocab_size=64, hf_checkpoint_dir=str(hf_dir)
+    )
+    with pytest.raises(FileNotFoundError, match="tokenizer.json"):
+        exporter._emit_model_companion_files(cfg, str(out_dir))
 
 
 def _tp2_model(constant_values: Mapping[str, list[Any]]) -> Any:
@@ -1019,6 +1045,67 @@ def test_compute_logits_returns_the_vocabulary_without_padding() -> None:
     assert torch.equal(logits, torch.matmul(hidden, lm_head.T)[:, :10])
 
 
+class _LlamaLikeBackbone(nn.Module):
+    """Backbone whose `forward` takes `intermediate_tensors` with no default."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.embed_tokens = nn.Embedding(8, 4)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        intermediate_tensors: Any,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        assert intermediate_tensors is None
+        return self.embed_tokens(input_ids)
+
+
+class _KvCacheArgBackbone(_LlamaLikeBackbone):
+    """Backbone that takes the KV caches and fails inside its forward."""
+
+    def forward(  # type: ignore[override]
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        kv_caches: Sequence[torch.Tensor] | None = None,
+        attn_metadata: Any = None,
+    ) -> torch.Tensor:
+        if kv_caches is not None:
+            raise TypeError("bug inside the model")
+        return self.embed_tokens(input_ids)
+
+
+def _run_backbone_forward(backbone: nn.Module) -> tuple[Sequence[Any], Any]:
+    cfg = api.TextOnlyLLMExportConfig(model_name="tiny", num_layers=0)
+    adapter = _adapter_without_model(cfg)
+    adapter._model = nn.Module()
+    adapter._model.model = backbone
+    weight = torch.arange(32.0).reshape(8, 4)
+    return adapter.forward(
+        {"model.embed_tokens.weight": weight},
+        [],
+        input_ids=torch.tensor([1, 2, 3]),
+        positions=torch.tensor([0, 1, 2]),
+        kv_lens=torch.tensor([3]),
+        block_tables=torch.zeros(1, 1, dtype=torch.int32),
+        query_start_loc=torch.tensor([0, 3]),
+        req_dist=torch.tensor([0, 0, 1]),
+    )
+
+
+def test_forward_passes_intermediate_tensors_to_the_backbone() -> None:
+    _, hidden = _run_backbone_forward(_LlamaLikeBackbone())
+    assert torch.equal(hidden, torch.arange(32.0).reshape(8, 4)[[1, 2, 3]])
+
+
+def test_forward_propagates_type_errors_raised_inside_the_backbone() -> None:
+    with pytest.raises(TypeError, match="bug inside the model"):
+        _run_backbone_forward(_KvCacheArgBackbone())
+
+
 def _pallas_impl(kv_dtype: torch.dtype | None) -> Any:
     from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackendImpl
 
@@ -1026,6 +1113,37 @@ def _pallas_impl(kv_dtype: torch.dtype | None) -> Any:
     impl.num_kv_heads, impl.head_size = 2, 128
     impl.kv_cache_quantized_dtype = kv_dtype
     return impl
+
+
+def _bare_layer(cls_path: str) -> Any:
+    module_name, cls_name = cls_path.rsplit(".", 1)
+    module = __import__(module_name, fromlist=[cls_name])
+    return object.__new__(getattr(module, cls_name))
+
+
+@pytest.mark.parametrize(
+    "cls_path",
+    [
+        "vllm.model_executor.layers.mamba.mamba_mixer2.MambaMixer2",
+        "vllm.model_executor.layers.mamba.short_conv.ShortConv",
+        "vllm.model_executor.layers.mamba.mamba_mixer.MambaMixer",
+    ],
+)
+def test_layer_state_specs_reject_unsupported_recurrent_layers(cls_path: str) -> None:
+    layer = _bare_layer(cls_path)
+    exportable = SimpleNamespace(
+        _export_config=SimpleNamespace(
+            dtype="bf16", num_blocks=16, block_size=32, tensor_parallel_size=1
+        ),
+        _attention_layers=lambda: [layer],
+    )
+    cls_name = cls_path.rsplit(".", 1)[1]
+    with pytest.raises(
+        NotImplementedError,
+        match=rf"recurrent layer {cls_name} is not supported by export; "
+        r"supported: GatedDeltaNetAttention",
+    ):
+        universal_adapter.UniversalVllmExportableLLM._layer_state_specs(exportable)
 
 
 @pytest.mark.parametrize("kv_dtype", [None, torch.float8_e4m3fn])
@@ -1048,6 +1166,7 @@ def test_layer_state_specs_declare_kv_and_recurrent_state(
             "_is_recurrent_layer",
             side_effect=lambda m: m is recurrent,
         ),
+        mock.patch.object(universal_adapter, "_check_recurrent_layer_supported"),
         mock.patch(
             "vllm.model_executor.layers.mamba.mamba_utils.is_conv_state_dim_first",
             return_value=False,
@@ -1141,6 +1260,17 @@ def test_launch_workers_keeps_rank0_output(tmp_path: Path) -> None:
         cli._launch_workers(["--model", "m"], 4, str(out_dir))
     assert json.loads((out_dir / "metadata.json").read_text()) == {"rank": 0}
     assert not list(tmp_path.glob(".export_ranks_*"))
+
+
+def test_launch_workers_creates_the_output_parent_dir(tmp_path: Path) -> None:
+    out_dir = tmp_path / "new" / "out"
+    with (
+        mock.patch.object(cli, "_worker_env", lambda tp: {}),
+        mock.patch.object(cli.subprocess, "Popen", _FakeWorker),
+    ):
+        cli._launch_workers(["--model", "m"], 1, str(out_dir))
+    assert json.loads((out_dir / "metadata.json").read_text()) == {"rank": 0}
+    assert not list((tmp_path / "new").glob(".export_ranks_*"))
 
 
 def test_launch_workers_fails_when_a_worker_fails(tmp_path: Path) -> None:

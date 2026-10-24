@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import inspect
 import math
 import os
 from collections.abc import Mapping, Sequence
@@ -113,26 +114,32 @@ def check_supported_parallelism(parallel_cfg: Any) -> tuple[int, int]:
 
 
 def resolve_hf_checkpoint_dir(model: str | None) -> str | None:
-    """Returns the local checkpoint directory for a path or a cached Hub repo id.
+    """Returns the local checkpoint directory for a path or a Hub repo id.
 
     The companion files (`config.json`, `tokenizer.json`, `generation_config.json`)
-    and the safetensors metadata are read from this directory, so a repo id that is
-    not in the local Hub cache is an error rather than a silently thinner artifact.
+    and the safetensors metadata are read from this directory. For a repo id the
+    companion files are fetched into the Hub cache first: loading dummy weights
+    caches `config.json` alone, so the tokenizer would otherwise be missing. A
+    repo without `config.json` is an error rather than a silently thinner
+    artifact.
     """
     if not model or os.path.isdir(model):
         return model
     from transformers.utils import cached_file
 
     hint = (
-        f"--model {model!r} is neither a local directory nor a repo in the "
-        "HuggingFace cache; download it first or pass the checkpoint directory"
+        f"--model {model!r} is neither a local directory nor a HuggingFace Hub "
+        "repo with a config.json; pass the checkpoint directory"
     )
     try:
-        config_path = cached_file(model, "config.json", local_files_only=True)
+        config_path = cached_file(model, "config.json")
     except OSError as e:
         raise FileNotFoundError(hint) from e
     if config_path is None:
         raise FileNotFoundError(hint)
+    # A missing tokenizer.json is reported by the exporter, which requires it.
+    for name in ("tokenizer.json", "generation_config.json"):
+        cached_file(model, name, _raise_exceptions_for_missing_entries=False)
     return os.path.dirname(config_path)
 
 
@@ -433,6 +440,31 @@ def load_vllm_model(vllm_config: Any, *, load_format: str) -> nn.Module:
 _MAX_CONSTANT_ELEMENTS = 4096
 
 
+def _backbone_kwargs(
+    backbone: nn.Module,
+    *,
+    input_ids: Any,
+    positions: Any,
+    kv_caches: Sequence[Any],
+    attn_metadata: Any,
+) -> dict[str, Any]:
+    """Keyword arguments for `backbone.forward`, chosen from its signature.
+
+    vLLM backbones take `intermediate_tensors` (positionally, often with no
+    default) and read the KV caches and metadata from the forward context; the
+    caches and metadata are passed directly only to a forward that declares them.
+    """
+    params = inspect.signature(backbone.forward).parameters
+    kwargs: dict[str, Any] = {"input_ids": input_ids, "positions": positions}
+    if "intermediate_tensors" in params:
+        kwargs["intermediate_tensors"] = None
+    if "kv_caches" in params:
+        kwargs["kv_caches"] = kv_caches
+    if "attn_metadata" in params:
+        kwargs["attn_metadata"] = attn_metadata
+    return kwargs
+
+
 def _is_recurrent_layer(layer: Any) -> bool:
     """Whether `layer` keeps fixed-size recurrent state (e.g. GDN linear attention)."""
     try:
@@ -440,6 +472,24 @@ def _is_recurrent_layer(layer: Any) -> bool:
     except ImportError:
         return False
     return isinstance(layer, MambaBase)
+
+
+def _check_recurrent_layer_supported(layer: Any) -> None:
+    """Raises unless export can bind `layer`'s state and drive its forward.
+
+    Export binds a recurrent layer's state as a conv/recurrent pair and hands
+    it the gated-delta-net style metadata, which only `GatedDeltaNetAttention`
+    layers read. Other recurrent layers (Mamba mixers, ShortConv) keep other
+    states and expect their own metadata type.
+    """
+    from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
+
+    if not isinstance(layer, GatedDeltaNetAttention):
+        raise NotImplementedError(
+            f"recurrent layer {type(layer).__name__} is not supported by export; "
+            "supported: GatedDeltaNetAttention (gated delta net linear attention, "
+            "e.g. Qwen3-Next)"
+        )
 
 
 def _recurrent_state_specs(
@@ -749,6 +799,7 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
                     ]
                 )
             elif _is_recurrent_layer(layer):
+                _check_recurrent_layer_supported(layer)
                 per_layer.append(
                     _recurrent_state_specs(
                         layer, cfg.num_blocks, cfg.tensor_parallel_size
@@ -865,17 +916,15 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
                         )
                     return backbone(**kw)
 
-                try:
-                    out = _call(
-                        {
-                            "input_ids": input_ids,
-                            "positions": positions,
-                            "kv_caches": working_kvs,
-                            "attn_metadata": forward_metadata,
-                        }
+                out = _call(
+                    _backbone_kwargs(
+                        backbone,
+                        input_ids=input_ids,
+                        positions=positions,
+                        kv_caches=working_kvs,
+                        attn_metadata=forward_metadata,
                     )
-                except TypeError:
-                    out = _call({"input_ids": input_ids, "positions": positions})
+                )
             finally:
                 if prev_do_not_compile is not None:
                     backbone.do_not_compile = prev_do_not_compile
