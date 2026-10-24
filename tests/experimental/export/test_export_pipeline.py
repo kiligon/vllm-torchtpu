@@ -1235,6 +1235,68 @@ def test_layer_state_specs_declare_kv_and_recurrent_state(
     assert kv.shape == PallasAttentionBackend.get_kv_cache_shape(16, 32, 2, 128, stored)
 
 
+@pytest.mark.parametrize("kv_dtype", [None, torch.float8_e4m3fn])
+def test_layer_state_specs_declare_the_mla_latent_cache(
+    kv_dtype: torch.dtype | None,
+) -> None:
+    from vllm_torchtpu.layers.adapter.attention import (
+        PallasMLAttentionBackend,
+        PallasMLAttentionBackendImpl,
+    )
+
+    # One latent KV head of kv_lora_rank + qk_rope_head_dim = 576, which the
+    # MLA kernel stores packed: [blocks, block_size / packing, packing, 640].
+    mla = SimpleNamespace(
+        impl=object.__new__(PallasMLAttentionBackendImpl),
+        head_size=576,
+        num_kv_heads=1,
+        kv_cache_quantized_dtype=kv_dtype,
+        use_sparse=False,
+    )
+    exportable = SimpleNamespace(
+        _export_config=SimpleNamespace(
+            dtype="bf16", num_blocks=16, block_size=1024, tensor_parallel_size=1
+        ),
+        _attention_layers=lambda: [mla],
+    )
+    per_layer = universal_adapter.UniversalVllmExportableLLM._layer_state_specs(
+        exportable
+    )
+    assert per_layer is not None
+    ((kv,),) = per_layer
+    stored = kv_dtype or torch.bfloat16
+    assert kv.dtype == tpu_lowering.dtype_name(stored)
+    assert kv.shape == PallasMLAttentionBackend.get_kv_cache_shape(
+        16, 1024, 1, 576, stored
+    )
+    packing = 4 if kv_dtype else 2
+    assert kv.shape == (16, 1024 // packing, packing, 640)
+
+
+def test_layer_state_specs_reject_sparse_mla() -> None:
+    from vllm_torchtpu.layers.adapter.attention import PallasMLAttentionBackendImpl
+
+    indexer_cache = SimpleNamespace(impl=None)
+    sparse_mla = SimpleNamespace(
+        impl=object.__new__(PallasMLAttentionBackendImpl),
+        head_size=576,
+        num_kv_heads=1,
+        kv_cache_quantized_dtype=None,
+        use_sparse=True,
+    )
+    exportable = SimpleNamespace(
+        _export_config=SimpleNamespace(
+            dtype="bf16", num_blocks=16, block_size=1024, tensor_parallel_size=1
+        ),
+        _attention_layers=lambda: [indexer_cache, sparse_mla],
+    )
+    with pytest.raises(
+        NotImplementedError,
+        match="sparse MLA is not supported by export",
+    ):
+        universal_adapter.UniversalVllmExportableLLM._layer_state_specs(exportable)
+
+
 @pytest.fixture
 def clean_launch_env(monkeypatch: pytest.MonkeyPatch) -> None:
     for key in (
@@ -1406,3 +1468,64 @@ def test_launch_workers_all_mode_saves_into_the_output_dir(tmp_path: Path) -> No
     # Every rank joins the same JAX coordinator.
     assert len({flag(c, checkpoint.JAX_COORDINATOR_FLAG) for c in cmds}) == 1
     assert not stale.exists()
+
+
+class _Router:
+    """A plain object holding a module's parameter, as vLLM MoE routers do."""
+
+    def __init__(self, bias: torch.Tensor) -> None:
+        self.bias = bias
+
+
+class _BackboneWithRouter(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.gate = nn.Module()
+        self.gate.bias = nn.Parameter(torch.zeros(4), requires_grad=False)
+        self.experts = nn.Module()
+        # Mirrors vLLM's MoERunner/RoutedExperts layout: the same `gate`
+        # submodule is reachable at two module paths (`gate` and
+        # `experts.gate`), `routed_experts` holds the shared Parameter directly,
+        # and `router` is a plain object holding the Parameter outside the
+        # module tree.
+        self.experts.gate = self.gate
+        self.experts.routed_experts = nn.Module()
+        self.experts.routed_experts.bias = self.gate.bias
+        self.experts.router = _Router(self.gate.bias)
+
+    def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> Any:
+        del positions
+        assert self.gate.bias is self.experts.routed_experts.bias
+        assert self.gate.bias is self.experts.router.bias
+        return input_ids.float()[:, None] + self.experts.router.bias[None, :]
+
+
+def test_forward_binds_weights_held_outside_the_module_tree() -> None:
+    wrapper = nn.Module()
+    wrapper.model = _BackboneWithRouter()
+    original = wrapper.model.gate.bias
+    exportable = object.__new__(universal_adapter.UniversalVllmExportableLLM)
+    exportable._model = wrapper
+    exportable._vllm_config = None
+    exportable._export_config = SimpleNamespace(dtype="bf16", max_num_seqs=1)
+    controls = {
+        name: torch.zeros(1, dtype=torch.int32)
+        for name in ("kv_lens", "block_tables", "query_start_loc", "req_dist")
+    }
+    for step in (1.0, 2.0):
+        bias = torch.arange(4, dtype=torch.float32) + step
+        _, hidden = exportable.forward(
+            {"model.gate.bias": bias},
+            [],
+            input_ids=torch.tensor([10, 20]),
+            positions=torch.tensor([0, 1]),
+            **controls,
+        )
+        # Every holder reads the bound weight, and repeated forward calls
+        # (probe pass + bucket lowering) leave the shared parameter intact.
+        assert torch.equal(hidden, torch.tensor([[10.0], [20.0]]) + bias)
+        assert wrapper.model.gate.bias is original
+        assert wrapper.model.experts.routed_experts.bias is original
+        assert wrapper.model.experts.router.bias is original
+        assert "bias" in wrapper.model.gate._parameters
+    assert torch.equal(original, torch.zeros(4))
