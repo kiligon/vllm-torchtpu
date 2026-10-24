@@ -584,9 +584,8 @@ def _export_text_only_llm_functions(
         }
 
     logits_variants: dict[str, Any] = {}
-    sample_tokens_variants: dict[str, Any] = {}
-    stochastic_variants: dict[str, Any] = {}
-    penalized_variants: dict[str, Any] = {}
+    # Sampler function -> request bucket -> variant, as export_samplers names them.
+    sampler_variants: dict[str, dict[str, Any]] = {}
 
     lm_head_struct = lowered[lm_head_name]
 
@@ -654,16 +653,13 @@ def _export_text_only_llm_functions(
             cfg.max_model_len,
             subdir=subdir,
         )
-        sample_tokens_variants[str(req_size)] = samplers["sample_tokens"]
-        stochastic_variants[str(req_size)] = samplers["sample_tokens_stochastic"]
-        penalized_variants[str(req_size)] = samplers["sample_tokens_penalized"]
+        for function, variant in samplers.items():
+            sampler_variants.setdefault(function, {})[str(req_size)] = variant
 
     return {
         "forward": forward_variants,
         "compute_logits": logits_variants,
-        "sample_tokens": sample_tokens_variants,
-        "sample_tokens_stochastic": stochastic_variants,
-        "sample_tokens_penalized": penalized_variants,
+        **sampler_variants,
     }
 
 

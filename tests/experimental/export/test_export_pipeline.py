@@ -334,6 +334,9 @@ def test_end_to_end_export_writes_no_weights(tmp_path) -> None:
     )
     assert os.path.isfile(os.path.join(out_dir, "subgraphs", "sample_tokens_req4.mlir"))
     assert os.path.isfile(
+        os.path.join(out_dir, "subgraphs", "sample_tokens_temperature_req4.mlir")
+    )
+    assert os.path.isfile(
         os.path.join(out_dir, "subgraphs", "sample_tokens_stochastic_req4.mlir")
     )
     assert os.path.isfile(
@@ -538,6 +541,7 @@ def test_compute_logits_output_is_the_samplers_intermediate_input(tmp_path) -> N
     functions = json.loads(Path(out_dir, "metadata.json").read_text())["functions"]
     samplers = [
         "sample_tokens",
+        "sample_tokens_temperature",
         "sample_tokens_stochastic",
         "sample_tokens_penalized",
     ]
@@ -1544,3 +1548,84 @@ def test_default_req_buckets_pad_like_the_vllm_runner(
     max_num_seqs: int, expected: tuple[int, ...]
 ) -> None:
     assert universal_adapter.default_req_buckets(max_num_seqs) == expected
+
+
+def test_uniform_per_logit_is_in_range_and_depends_only_on_the_row() -> None:
+    uniform = torch.tensor([0.1, 0.5, 0.9, 0.5])
+    u = sampling.uniform_per_logit(uniform, 1000)
+    assert u.shape == (4, 1000) and u.dtype == torch.float32
+    assert bool((u > 0).all()) and bool((u < 1).all())
+    assert torch.equal(u[1], u[3])  # same seed, same values
+    assert not torch.equal(u[0], u[1])
+    alone = sampling.uniform_per_logit(uniform[2:3], 1000)
+    assert torch.equal(alone[0], u[2])  # batch-invariant
+    assert abs(float(u.mean()) - 0.5) < 0.02
+
+
+def _sample_frequencies(sample, logits_row, rows=20000, **params):
+    torch.manual_seed(0)
+    logits = logits_row.expand(rows, -1).contiguous()
+    uniform = torch.rand(rows)
+    tokens = sample(logits, uniform=uniform, **params).squeeze(-1)
+    return torch.bincount(tokens, minlength=logits.shape[-1]).float() / rows
+
+
+def test_temperature_and_stochastic_samplers_follow_the_softmax() -> None:
+    logits_row = torch.tensor([[2.0, 1.0, 0.5, 0.0, -1.0, -3.0]])
+    rows = 20000
+    temp = torch.full((rows,), 0.7)
+    expected = torch.softmax(logits_row[0] / 0.7, dim=-1)
+    freq = _sample_frequencies(
+        lambda logits, uniform, **p: sampling.temperature_tokens(logits, temp, uniform),
+        logits_row,
+        rows,
+    )
+    assert torch.allclose(freq, expected, atol=0.015), (freq, expected)
+    no_k = torch.zeros(rows, dtype=torch.int32)
+    no_p = torch.ones(rows)
+    freq = _sample_frequencies(
+        lambda logits, uniform, **p: sampling.stochastic_tokens(
+            logits, temp, no_k, no_p, torch.zeros(rows), uniform
+        ),
+        logits_row,
+        rows,
+    )
+    assert torch.allclose(freq, expected, atol=0.015), (freq, expected)
+
+
+def test_stochastic_sampler_keeps_only_the_top_k_and_top_p_tokens() -> None:
+    logits_row = torch.tensor([[3.0, 2.5, 2.0, 0.0, -1.0, -2.0]])
+    rows = 4000
+    temp = torch.ones(rows)
+    top_k = torch.full((rows,), 2, dtype=torch.int32)
+    freq = _sample_frequencies(
+        lambda logits, uniform, **p: sampling.stochastic_tokens(
+            logits, temp, top_k, torch.ones(rows), torch.zeros(rows), uniform
+        ),
+        logits_row,
+        rows,
+    )
+    assert float(freq[2:].sum()) == 0.0 and float(freq[:2].min()) > 0.2
+    top_p = torch.full((rows,), 0.5)
+    freq = _sample_frequencies(
+        lambda logits, uniform, **p: sampling.stochastic_tokens(
+            logits, temp, torch.zeros(rows, dtype=torch.int32), top_p,
+            torch.zeros(rows), uniform
+        ),
+        logits_row,
+        rows,
+    )
+    # softmax([3, 2.5, 2, ...]) = [0.47, 0.29, ...]: the top-p set is tokens 0 and 1.
+    assert float(freq[2:].sum()) == 0.0 and float(freq[1]) > 0.2
+
+
+def test_zero_temperature_rows_take_the_argmax() -> None:
+    logits = torch.tensor([[0.0, 5.0, 1.0], [4.0, 0.0, 1.0]])
+    temp = torch.tensor([0.0, 0.0])
+    uniform = torch.tensor([0.3, 0.8])
+    assert sampling.temperature_tokens(logits, temp, uniform).squeeze(-1).tolist() == [1, 0]
+    tokens = sampling.stochastic_tokens(
+        logits, temp, torch.tensor([1, 1], dtype=torch.int32), torch.ones(2),
+        torch.zeros(2), uniform,
+    )
+    assert tokens.squeeze(-1).tolist() == [1, 0]
