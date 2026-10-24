@@ -357,10 +357,14 @@ class _TinyRecurrentExportableLLM(_TinyTorchExportableLLM):
                 cfg.dtype,
             ),
             api.ShapeDtypeStruct(
-                (cfg.num_blocks, 3, 1, 8), "f32", sharding=[None, None, None, "model"]
+                (cfg.num_state_slots, 3, 1, 8),
+                "f32",
+                sharding=[None, None, None, "model"],
             ),
             api.ShapeDtypeStruct(
-                (cfg.num_blocks, 2, 4, 4), "f32", sharding=[None, "model", None, None]
+                (cfg.num_state_slots, 2, 4, 4),
+                "f32",
+                sharding=[None, "model", None, None],
             ),
         ]
 
@@ -412,9 +416,11 @@ def test_end_to_end_export_of_a_recurrent_model(tmp_path: Path) -> None:
     states = [t for t in forward["inputs"] if t["argument_type"] == "state"]
     assert [(t["shape"], t["dtype"], t["sharding"]) for t in states] == [
         ([16, 8, 4, 8], "bf16", [None, None, None, None]),
-        ([16, 3, 1, 8], "f32", [None, None, None, "model"]),
-        ([16, 2, 4, 4], "f32", [None, "model", None, None]),
+        ([9, 3, 1, 8], "f32", [None, None, None, "model"]),
+        ([9, 2, 4, 4], "f32", [None, "model", None, None]),
     ]
+    # Recurrent state pools hold one slot per sequence plus null slot 0.
+    assert meta["serving_config"]["num_state_slots"] == 9
     # The recurrent control input follows the state, which keeps its indices.
     last = forward["inputs"][-1]
     assert last["name"] == "mamba_state_indices"
@@ -455,7 +461,7 @@ def test_recurrent_state_specs_split_conv_channels_and_value_heads(
         return_value=False,
     ):
         conv, recurrent = universal_adapter._recurrent_state_specs(
-            _FakeRecurrentLayer(), num_blocks=32, tp_size=tp_size
+            _FakeRecurrentLayer(), num_slots=32, tp_size=tp_size
         )
     split = "model" if tp_size > 1 else None
     assert (conv.shape, conv.dtype, conv.sharding) == (
@@ -729,6 +735,28 @@ def test_fit_num_blocks_to_hbm_uses_kv_cache_memory_bytes_without_the_device() -
         assert adapter.fit_num_blocks_to_hbm(0.9, 33 * block_bytes + 1) == 33
     hbm.assert_not_called()
     assert adapter.export_config.num_blocks == 33
+
+
+def test_fit_num_blocks_to_hbm_takes_recurrent_state_off_the_budget_first() -> None:
+    cfg = api.TextOnlyLLMExportConfig(
+        model_name="tiny", num_layers=1, num_kv_heads=4, head_dim=128, block_size=128
+    )
+    adapter = _adapter_without_model(cfg)
+    state_bytes = 1000
+    kv_block_bytes = 128 * 4 * 2 * 128 * 2
+
+    def abstract_states() -> list[api.ShapeDtypeStruct]:
+        c = adapter.export_config
+        return [
+            api.ShapeDtypeStruct((c.num_blocks, 128, 8, 128), "bf16"),
+            # A recurrent state pool: one f32 slot of `state_bytes` per sequence.
+            api.ShapeDtypeStruct((c.num_state_slots, state_bytes // 4), "f32"),
+        ]
+
+    adapter.abstract_states = abstract_states
+    fixed = cfg.num_state_slots * state_bytes
+    assert adapter.fit_num_blocks_to_hbm(0.9, fixed + 33 * kv_block_bytes + 1) == 33
+    assert adapter.abstract_states()[1].shape[0] == cfg.num_state_slots
 
 
 def test_fit_num_blocks_to_hbm_rejects_a_budget_without_room_for_a_block() -> None:
@@ -1212,7 +1240,11 @@ def test_layer_state_specs_declare_kv_and_recurrent_state(
     recurrent = _FakeRecurrentLayer()
     exportable = SimpleNamespace(
         _export_config=SimpleNamespace(
-            dtype="bf16", num_blocks=16, block_size=32, tensor_parallel_size=1
+            dtype="bf16",
+            num_blocks=16,
+            num_state_slots=9,
+            block_size=32,
+            tensor_parallel_size=1,
         ),
         _attention_layers=lambda: [recurrent, attention],
     )
@@ -1231,7 +1263,8 @@ def test_layer_state_specs_declare_kv_and_recurrent_state(
         recurrent_states, kv_states = (
             universal_adapter.UniversalVllmExportableLLM._layer_state_specs(exportable)
         )
-    assert [s.shape for s in recurrent_states] == [(16, 3, 1, 64), (16, 4, 16, 16)]
+    # Recurrent state is per sequence slot; the KV cache is per block.
+    assert [s.shape for s in recurrent_states] == [(9, 3, 1, 64), (9, 4, 16, 16)]
     # An fp8 KV cache is declared in fp8, with fp8's packing.
     stored = kv_dtype or torch.bfloat16
     (kv,) = kv_states

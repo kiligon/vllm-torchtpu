@@ -121,6 +121,15 @@ class TextOnlyLLMExportConfig(ModelExportConfig):
         """Length of query_start_loc: one cumulative offset per sequence plus 1."""
         return self.max_num_seqs + 1
 
+    @property
+    def num_state_slots(self) -> int:
+        """Slots of each recurrent state pool: one per sequence plus null slot 0.
+
+        A recurrent layer's state is fixed-size per sequence, so its pool is sized
+        by `max_num_seqs`, not by the paged KV `num_blocks`.
+        """
+        return self.max_num_seqs + 1
+
 
 @runtime_checkable
 class ExportableModel(Protocol):

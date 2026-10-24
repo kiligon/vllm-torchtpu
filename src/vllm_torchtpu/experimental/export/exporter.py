@@ -394,6 +394,25 @@ def _extra_user_inputs(
     return list(extra_fn()) if callable(extra_fn) else []
 
 
+def _recurrent_serving_config(model: api.ExportableTextOnlyLLM) -> dict[str, int]:
+    """`num_state_slots` for a model with recurrent state, else nothing.
+
+    The runtime tells a recurrent state pool (`[num_state_slots, ...]`) from a
+    paged KV pool (`[num_blocks, ...]`) by its leading dimension, so the two must
+    differ.
+    """
+    if not any(n == "mamba_state_indices" for n, _ in _extra_user_inputs(model)):
+        return {}
+    cfg = model.export_config
+    if cfg.num_state_slots == cfg.num_blocks:
+        raise ValueError(
+            f"num_blocks ({cfg.num_blocks}) equals num_state_slots (max_num_seqs + 1), "
+            "so the runtime could not tell KV pools from recurrent state pools; pass "
+            "another --num-blocks"
+        )
+    return {"num_state_slots": cfg.num_state_slots}
+
+
 def _main_args_read(mlir_text: str) -> set[int]:
     """Indices of the `@main` arguments that its body reads."""
     header = re.search(r"func\.func public @main\((.*)\)[^\n]*\{\n", mlir_text)
@@ -825,6 +844,7 @@ def export(
         "max_cu_seqs": cfg.max_cu_seqs,
         "block_size": cfg.block_size,
         "num_blocks": cfg.num_blocks,
+        **_recurrent_serving_config(model),
         "max_model_len": cfg.max_model_len,
         "tensor_parallel_size": tp_size,
         "pipeline_parallel_size": pp_size,

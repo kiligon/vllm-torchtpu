@@ -571,9 +571,9 @@ def _check_recurrent_layer_supported(layer: Any) -> None:
 
 
 def _recurrent_state_specs(
-    layer: Any, num_blocks: int, tp_size: int
+    layer: Any, num_slots: int, tp_size: int
 ) -> list[api.ShapeDtypeStruct]:
-    """Device-local `[num_blocks, ...]` specs of a recurrent layer's two states.
+    """Device-local `[num_slots, ...]` specs of a recurrent layer's two states.
 
     `get_state_shape` gives one block's device-local shapes. The conv state is
     split over the model axis along its channel dimension and the recurrent
@@ -594,7 +594,7 @@ def _recurrent_state_specs(
             sharding[split_dim + 1] = "model"
         specs.append(
             api.ShapeDtypeStruct(
-                shape=[num_blocks, *(int(d) for d in shape)],
+                shape=[num_slots, *(int(d) for d in shape)],
                 dtype=tpu_lowering.dtype_name(dtype),
                 sharding=sharding,
             )
@@ -682,9 +682,11 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
         Same budget as `TPUWorker.determine_available_memory`: `kv_cache_memory_bytes`
         when given, otherwise the HBM limit of `devices` (default: this rank's TPU)
         times `gpu_memory_utilization`, minus the HBM already in use (the loaded
-        model). Export runs no profile pass, so activation scratch has to fit in the
-        headroom `gpu_memory_utilization` leaves. Collective: rank 0's artifact
-        serves every rank, so all ranks take the minimum.
+        model). Recurrent state pools are sized by `num_state_slots`, not by
+        `num_blocks`, so their bytes come off the budget first and the rest is
+        divided among KV blocks. Export runs no profile pass, so activation scratch
+        has to fit in the headroom `gpu_memory_utilization` leaves. Collective: rank
+        0's artifact serves every rank, so all ranks take the minimum.
         """
         from vllm_torchtpu import utils
 
@@ -702,11 +704,10 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
                 f"({budget.total_limit} bytes total)"
             )
         num_blocks = self._export_config.num_blocks
-        kv_bytes = sum(
-            math.prod(s.shape) * tpu_lowering.torch_dtype(s.dtype).itemsize
-            for s in self.abstract_states()
-        )
-        fitted = max(available, 0) * num_blocks // kv_bytes
+        total_bytes = self._state_bytes(num_blocks)
+        block_bytes = self._state_bytes(num_blocks + 1) - total_bytes
+        fixed_bytes = total_bytes - num_blocks * block_bytes
+        fitted = max(available - fixed_bytes, 0) // block_bytes
         if (
             torch.distributed.is_initialized()
             and torch.distributed.get_world_size() > 1
@@ -720,13 +721,26 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
             fitted = int(t.item())
         if fitted < 1:
             raise ValueError(
-                f"no KV cache block ({kv_bytes // num_blocks} bytes) fits in the KV "
-                f"budget: {limit_msg}; raise the budget or pass --num-blocks"
+                f"no KV cache block ({block_bytes} bytes) fits in the KV budget after "
+                f"{fixed_bytes} bytes of recurrent state: {limit_msg}; raise the "
+                "budget or pass --num-blocks"
             )
         self._export_config = dataclasses.replace(
             self._export_config, num_blocks=fitted
         )
         return fitted
+
+    def _state_bytes(self, num_blocks: int) -> int:
+        """Bytes of this rank's state tensors when exported with `num_blocks`."""
+        saved = self._export_config
+        self._export_config = dataclasses.replace(saved, num_blocks=num_blocks)
+        try:
+            return sum(
+                math.prod(s.shape) * tpu_lowering.torch_dtype(s.dtype).itemsize
+                for s in self.abstract_states()
+            )
+        finally:
+            self._export_config = saved
 
     def abstract_params(self) -> Mapping[str, api.ShapeDtypeStruct]:
         """Builds abstract specs for the model's parameters and buffers.
@@ -838,8 +852,8 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
         """The state tensors of each attention layer, or None if any is unknown.
 
         A paged attention layer holds one KV cache; a recurrent (GDN) layer holds
-        its conv and recurrent states, `[num_blocks, ...]` each and indexed by the
-        `mamba_state_indices` block of each request.
+        its conv and recurrent states, `[num_state_slots, ...]` each and indexed by
+        the `mamba_state_indices` slot of each request.
         """
         cfg = self._export_config
         act_dtype_str = tpu_lowering.dtype_name(cfg.dtype)
@@ -911,7 +925,7 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
                 _check_recurrent_layer_supported(layer)
                 per_layer.append(
                     _recurrent_state_specs(
-                        layer, cfg.num_blocks, cfg.tensor_parallel_size
+                        layer, cfg.num_state_slots, cfg.tensor_parallel_size
                     )
                 )
             else:
@@ -921,7 +935,7 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
     def extra_user_inputs(self) -> list[tuple[str, tuple[int, ...]]]:
         """Control inputs beyond the standard six that `forward` takes.
 
-        Recurrent layers read each request's state block from
+        Recurrent layers read each request's state slot from
         `mamba_state_indices`.
         """
         if self._has_recurrent_layers():
