@@ -785,6 +785,58 @@ def test_generation_config_is_not_declared_when_the_checkpoint_has_none(
     assert not (out_dir / "generation_config.json").exists()
 
 
+@pytest.mark.parametrize(
+    "files,expected",
+    [
+        (
+            {
+                "chat_template.jinja": "jinja file",
+                "tokenizer_config.json": json.dumps({"chat_template": "config"}),
+            },
+            "jinja file",
+        ),
+        ({"tokenizer_config.json": json.dumps({"chat_template": "config"})}, "config"),
+        (
+            {
+                "tokenizer_config.json": json.dumps(
+                    {
+                        "chat_template": [
+                            {"name": "tool_use", "template": "tools"},
+                            {"name": "default", "template": "named default"},
+                        ]
+                    }
+                )
+            },
+            "named default",
+        ),
+        ({"tokenizer_config.json": json.dumps({"bos_token": "<s>"})}, None),
+        ({}, None),
+    ],
+)
+def test_chat_template_is_written_and_declared_like_huggingface_finds_it(
+    tmp_path, files: dict[str, str], expected: str | None
+) -> None:
+    hf_dir = tmp_path / "hf_ckpt"
+    hf_dir.mkdir()
+    (hf_dir / "tokenizer.json").write_text(json.dumps({"version": "1.0"}))
+    for name, text in files.items():
+        (hf_dir / name).write_text(text)
+    out_dir = tmp_path / "artifact"
+    out_dir.mkdir()
+    cfg = api.TextOnlyLLMExportConfig(
+        model_name="tiny", vocab_size=64, hf_checkpoint_dir=str(hf_dir)
+    )
+
+    serving_config = exporter._emit_model_companion_files(cfg, str(out_dir))
+
+    if expected is None:
+        assert "chat_template" not in serving_config
+        assert not (out_dir / "chat_template.jinja").exists()
+    else:
+        assert serving_config["chat_template"] == {"path": "chat_template.jinja"}
+        assert (out_dir / "chat_template.jinja").read_text() == expected
+
+
 def _parallel_vllm_cfg(tmp_path: Path, tp: int, dp: int, pp: int) -> Any:
     return SimpleNamespace(
         model_config=SimpleNamespace(

@@ -672,9 +672,10 @@ def _emit_model_companion_files(
 ) -> dict[str, Any]:
     """Copies companion files into the artifact; returns their `serving_config` entries.
 
-    `tokenizer.json` (required unless a byte tokenizer is emitted) and
-    `generation_config.json` (when the checkpoint has one) are copied and declared
-    in `serving_config` by path; the runtime reads no other file.
+    `tokenizer.json` (required unless a byte tokenizer is emitted),
+    `generation_config.json`, and the chat template (as `chat_template.jinja`), the
+    latter two when the checkpoint has them, are written and declared in
+    `serving_config` by path; the runtime reads no other file.
     """
     serving_config: dict[str, Any] = {}
 
@@ -727,7 +728,35 @@ def _emit_model_companion_files(
             shutil.copyfile(src_gen, dst_gen)
             serving_config["generation_config"] = {"path": "generation_config.json"}
 
+        chat_template = _hf_chat_template(cfg.hf_checkpoint_dir)
+        if chat_template is not None:
+            with open(os.path.join(output_dir, "chat_template.jinja"), "w") as f:
+                f.write(chat_template)
+            serving_config["chat_template"] = {"path": "chat_template.jinja"}
+
     return serving_config
+
+
+def _hf_chat_template(hf_checkpoint_dir: str) -> str | None:
+    """The checkpoint's chat template, as HuggingFace finds it.
+
+    `chat_template.jinja` takes precedence over `tokenizer_config.json`'s
+    `chat_template`, which is a template or a list of named templates (`default` is
+    the one chat requests use).
+    """
+    jinja_path = os.path.join(hf_checkpoint_dir, "chat_template.jinja")
+    if os.path.isfile(jinja_path):
+        with open(jinja_path) as f:
+            return f.read()
+    config_path = os.path.join(hf_checkpoint_dir, "tokenizer_config.json")
+    if not os.path.isfile(config_path):
+        return None
+    with open(config_path) as f:
+        template = json.load(f).get("chat_template")
+    if isinstance(template, list):
+        named = {t.get("name"): t.get("template") for t in template}
+        template = named.get("default")
+    return template if isinstance(template, str) else None
 
 
 @trace("export.export")
