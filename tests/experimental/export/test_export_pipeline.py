@@ -36,6 +36,7 @@ from vllm_torchtpu.experimental.export import (
     tpu_lowering,
     universal_adapter,
     validator,
+    weight_mapper,
 )
 
 
@@ -442,6 +443,41 @@ def test_lm_head_name_finds_a_nested_language_model_head() -> None:
     assert exporter._lm_head_name(params) == "language_model.lm_head.weight"
     del params["language_model.lm_head.weight"]
     assert exporter._lm_head_name(params) == "language_model.model.embed_tokens.weight"
+
+
+@pytest.mark.parametrize(
+    ("names", "alias"),
+    [
+        # A tied head is named after the embedding, nested or not.
+        (["model.embed_tokens.weight"], ("lm_head.weight", "model.embed_tokens.weight")),
+        (
+            [
+                "language_model.model.embed_tokens.weight",
+                "visual.patch_embed.proj.weight",
+                "mtp.embed_tokens.weight",
+            ],
+            ("language_model.lm_head.weight", "language_model.model.embed_tokens.weight"),
+        ),
+        # An untied head has its own weight.
+        (["model.embed_tokens.weight", "lm_head.weight"], None),
+        (["language_model.model.embed_tokens.weight", "language_model.lm_head.weight"], None),
+    ],
+)
+def test_tied_lm_head_alias(names: list[str], alias: tuple[str, str] | None) -> None:
+    assert weight_mapper.tied_lm_head_alias(names) == alias
+
+
+def test_a_nested_tied_lm_head_keeps_the_embedding_a_forward_weight() -> None:
+    # Qwen3.5-0.8B: a multimodal model whose language model ties lm_head to the embedding.
+    model = nn.Module()
+    model.language_model = nn.Module()
+    model.language_model.model = nn.Module()
+    embed = nn.Embedding(32, 8)
+    model.language_model.model.embed_tokens = embed
+    tensors = checkpoint.local_tensors(model)
+    assert tensors["language_model.lm_head.weight"] is embed.weight
+    # compute_logits projects with the alias, so forward keeps the embedding.
+    assert exporter._lm_head_name(tensors) == "language_model.lm_head.weight"
 
 
 class _FakeRecurrentLayer:

@@ -779,21 +779,16 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
                 ),
             )
 
-        # Ensure lm_head.weight is present even when tied to embed_tokens.weight
-        if "lm_head.weight" not in params:
-            for cand in (
-                "model.embed_tokens.weight",
-                "embed_tokens.weight",
-                "transformer.wte.weight",
-            ):
-                if cand in params:
-                    emb_spec = params[cand]
-                    params["lm_head.weight"] = api.ShapeDtypeStruct(
-                        shape=emb_spec.shape,
-                        dtype=emb_spec.dtype,
-                        sharding=emb_spec.sharding,
-                    )
-                    break
+        # A tied LM head projects with the embedding; give it its own name, so the
+        # embedding stays a forward input and the head a compute_logits one.
+        tied = weight_mapper.tied_lm_head_alias(params)
+        if tied:
+            emb_spec = params[tied[1]]
+            params[tied[0]] = api.ShapeDtypeStruct(
+                shape=emb_spec.shape,
+                dtype=emb_spec.dtype,
+                sharding=emb_spec.sharding,
+            )
         return params
 
     def constant_names(self) -> set[str]:
