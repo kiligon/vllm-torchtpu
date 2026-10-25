@@ -2529,6 +2529,39 @@ class TestRaidenStoreWorkerStub(unittest.TestCase):
         self.assertEqual(worker.get_finished(), [])
         self.assertIsNone(worker.wait({1, 2}))
 
+    def test_controller_reachable_rejects_tcp_loopback_self_connect(self):
+        from vllm_torchtpu.offload.raiden_store import RaidenStoreOffloadingWorker
+
+        worker = object.__new__(RaidenStoreOffloadingWorker)
+        worker._controller_address = "127.0.0.1:48800"
+
+        self_connected_sock = MagicMock()
+        self_connected_sock.__enter__.return_value = self_connected_sock
+        self_connected_sock.getsockname.return_value = ("127.0.0.1", 48800)
+        self_connected_sock.getpeername.return_value = ("127.0.0.1", 48800)
+
+        with patch(
+            "vllm_torchtpu.offload.raiden_store.socket.create_connection",
+            return_value=self_connected_sock,
+        ):
+            self.assertFalse(worker._controller_reachable())
+
+    def test_controller_reachable_accepts_listening_server(self):
+        import socket
+
+        from vllm_torchtpu.offload.raiden_store import RaidenStoreOffloadingWorker
+
+        worker = object.__new__(RaidenStoreOffloadingWorker)
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+            server.bind(("127.0.0.1", 0))
+            server.listen(1)
+            port = server.getsockname()[1]
+            worker._controller_address = f"127.0.0.1:{port}"
+            self.assertTrue(worker._controller_reachable())
+
+        # Once the server closes, probing returns False.
+        self.assertFalse(worker._controller_reachable())
+
 
 # -- storage tier: settings, backend configs, and plumbing ---------------------
 

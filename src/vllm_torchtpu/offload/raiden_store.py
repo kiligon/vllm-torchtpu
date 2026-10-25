@@ -131,7 +131,11 @@ _DRAIN_TIMEOUT_S = envs.VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S
 # be reused, so re-reading them would ship garbage.
 _SAVE_RETRIES = envs.VLLM_TPU_OFFLOAD_SAVE_RETRIES
 
-_DEFAULT_CONTROLLER_PORT = 51515
+# Keep the default controller port below Linux's default ephemeral range
+# (net.ipv4.ip_local_port_range = 32768..60999) so kernel-assigned client
+# sockets cannot claim the port or trigger TCP loopback self-connects while
+# workers poll before KVCacheStore binds.
+_DEFAULT_CONTROLLER_PORT = 27800
 
 # Host bytes behind one offloaded block, summed over every worker rank, as
 # recorded from the per-worker KV cache configs before the offloading spec is
@@ -1697,8 +1701,13 @@ class RaidenStoreOffloadingWorker(OffloadingWorker):
         host, _, port = self._controller_address.rpartition(":")
         host = host.strip("[]")
         try:
-            with socket.create_connection((host, int(port)), timeout=1.0):
-                return True
+            with socket.create_connection((host, int(port)), timeout=1.0) as sock:
+                # Guard against TCP simultaneous-open loopback self-connect:
+                # if the target port lies inside the kernel's ephemeral range
+                # and no server is listening yet, the kernel can assign the
+                # destination port as the probe socket's own source port and
+                # connect the socket to itself.
+                return sock.getsockname() != sock.getpeername()
         except OSError:
             return False
 
