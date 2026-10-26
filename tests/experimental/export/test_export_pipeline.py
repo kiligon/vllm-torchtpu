@@ -449,18 +449,30 @@ def test_lm_head_name_finds_a_nested_language_model_head() -> None:
     ("names", "alias"),
     [
         # A tied head is named after the embedding, nested or not.
-        (["model.embed_tokens.weight"], ("lm_head.weight", "model.embed_tokens.weight")),
+        (
+            ["model.embed_tokens.weight"],
+            ("lm_head.weight", "model.embed_tokens.weight"),
+        ),
         (
             [
                 "language_model.model.embed_tokens.weight",
                 "visual.patch_embed.proj.weight",
                 "mtp.embed_tokens.weight",
             ],
-            ("language_model.lm_head.weight", "language_model.model.embed_tokens.weight"),
+            (
+                "language_model.lm_head.weight",
+                "language_model.model.embed_tokens.weight",
+            ),
         ),
         # An untied head has its own weight.
         (["model.embed_tokens.weight", "lm_head.weight"], None),
-        (["language_model.model.embed_tokens.weight", "language_model.lm_head.weight"], None),
+        (
+            [
+                "language_model.model.embed_tokens.weight",
+                "language_model.lm_head.weight",
+            ],
+            None,
+        ),
     ],
 )
 def test_tied_lm_head_alias(names: list[str], alias: tuple[str, str] | None) -> None:
@@ -468,7 +480,8 @@ def test_tied_lm_head_alias(names: list[str], alias: tuple[str, str] | None) -> 
 
 
 def test_a_nested_tied_lm_head_keeps_the_embedding_a_forward_weight() -> None:
-    # Qwen3.5-0.8B: a multimodal model whose language model ties lm_head to the embedding.
+    # Qwen3.5-0.8B: a multimodal model whose language model ties lm_head to the
+    # embedding.
     model = nn.Module()
     model.language_model = nn.Module()
     model.language_model.model = nn.Module()
@@ -554,6 +567,124 @@ def test_metadata_has_one_serving_config_with_what_the_runtime_reads(tmp_path) -
         "tokenizer_config",
     }
     assert (serving["vocab_size"], serving["num_blocks"]) == (32, 16)
+
+
+def test_metadata_declares_the_speculative_config_it_was_exported_with(
+    tmp_path,
+) -> None:
+    speculative = {
+        "method": "ngram",
+        "num_speculative_tokens": 4,
+        "prompt_lookup_max": 3,
+        "prompt_lookup_min": 3,
+    }
+    cfg = api.TextOnlyLLMExportConfig(
+        model_name="tiny-torch",
+        vocab_size=32,
+        hidden_size=16,
+        num_layers=1,
+        num_q_heads=2,
+        num_kv_heads=2,
+        head_dim=8,
+        block_size=8,
+        num_blocks=16,
+        max_num_seqs=8,
+        max_model_len=64,
+        token_buckets=(8,),
+        req_buckets=(4, 8),
+        emit_byte_tokenizer=True,
+        speculative_config=speculative,
+    )
+    out_dir = str(tmp_path / "exported")
+    with mock.patch.object(
+        tpu_lowering,
+        "lower_torch_callable_to_mlir",
+        side_effect=_mock_lower_torch_callable_to_mlir,
+    ):
+        exporter.export(_TinyTorchExportableLLM(cfg), out_dir)
+    meta = json.loads(Path(out_dir, "metadata.json").read_text())
+    assert meta["serving_config"]["speculative_config"] == speculative
+
+
+def test_parse_args_takes_the_vllm_serve_command_line(capsys) -> None:
+    # What a `vllm serve` benchmark config passes, model tag included: engine
+    # arguments shape the artifact, frontend options are reported and ignored.
+    parser = cli.build_arg_parser()
+    if "model_tag" not in {a.dest for a in parser._actions}:
+        pytest.skip(
+            "vLLM cannot build its serve parser here (its platform's device is "
+            "unavailable); run with VLLM_TARGET_DEVICE=cpu VLLM_PLUGINS="
+        )
+    args = cli.parse_args(
+        [
+            "Qwen/Qwen3-0.6B",
+            "--output-dir",
+            "/tmp/out",
+            "--max-model-len",
+            "1024",
+            "--block-size",
+            "32",
+            "--port",
+            "8001",
+            "--default-chat-template-kwargs",
+            '{"enable_thinking": false}',
+            "--enable-auto-tool-choice",
+            "--tool-call-parser",
+            "hermes",
+        ]
+    )
+    assert args.model == "Qwen/Qwen3-0.6B"
+    assert (args.max_model_len, args.block_size) == (1024, 32)
+    ignored = capsys.readouterr().err
+    for flag in [
+        "--port",
+        "--default-chat-template-kwargs",
+        "--enable-auto-tool-choice",
+        "--tool-call-parser",
+    ]:
+        assert flag in ignored, ignored
+    for flag in ["--max-model-len", "--block-size", "--output-dir"]:
+        assert flag not in ignored, ignored
+
+
+def test_export_speculative_config_keeps_vllm_field_names() -> None:
+    assert cli.export_speculative_config(None) is None
+    assert cli.export_speculative_config(
+        '{"method": "ngram", "num_speculative_tokens": 4, "prompt_lookup_max": 3}'
+    ) == {
+        "method": "ngram",
+        "num_speculative_tokens": 4,
+        "prompt_lookup_max": 3,
+        "prompt_lookup_min": 3,
+    }
+
+
+@pytest.mark.parametrize(
+    "raw, error",
+    [
+        ({"method": "mtp", "num_speculative_tokens": 1}, "not supported"),
+        ({"method": "ngram", "prompt_lookup_max": 3}, "num_speculative_tokens"),
+        ({"method": "ngram", "num_speculative_tokens": 2}, "prompt_lookup_max"),
+        (
+            {"method": "ngram", "num_speculative_tokens": 0, "prompt_lookup_max": 3},
+            "num_speculative_tokens",
+        ),
+        (
+            {
+                "method": "ngram",
+                "num_speculative_tokens": 2,
+                "prompt_lookup_max": 3,
+                "model": "x",
+            },
+            "fields",
+        ),
+    ],
+)
+def test_export_speculative_config_rejects_what_the_runtime_cannot_run(
+    raw: dict[str, Any], error: str
+) -> None:
+    with pytest.raises(ValueError, match=error):
+        cli.export_speculative_config(raw)
 
 
 def test_compute_logits_output_is_the_samplers_intermediate_input(tmp_path) -> None:
@@ -1678,8 +1809,12 @@ def test_stochastic_sampler_keeps_only_the_top_k_and_top_p_tokens() -> None:
     top_p = torch.full((rows,), 0.5)
     freq = _sample_frequencies(
         lambda logits, uniform, **p: sampling.stochastic_tokens(
-            logits, temp, torch.zeros(rows, dtype=torch.int32), top_p,
-            torch.zeros(rows), uniform
+            logits,
+            temp,
+            torch.zeros(rows, dtype=torch.int32),
+            top_p,
+            torch.zeros(rows),
+            uniform,
         ),
         logits_row,
         rows,
@@ -1692,9 +1827,16 @@ def test_zero_temperature_rows_take_the_argmax() -> None:
     logits = torch.tensor([[0.0, 5.0, 1.0], [4.0, 0.0, 1.0]])
     temp = torch.tensor([0.0, 0.0])
     uniform = torch.tensor([0.3, 0.8])
-    assert sampling.temperature_tokens(logits, temp, uniform).squeeze(-1).tolist() == [1, 0]
+    assert sampling.temperature_tokens(logits, temp, uniform).squeeze(-1).tolist() == [
+        1,
+        0,
+    ]
     tokens = sampling.stochastic_tokens(
-        logits, temp, torch.tensor([1, 1], dtype=torch.int32), torch.ones(2),
-        torch.zeros(2), uniform,
+        logits,
+        temp,
+        torch.tensor([1, 1], dtype=torch.int32),
+        torch.ones(2),
+        torch.zeros(2),
+        uniform,
     )
     assert tokens.squeeze(-1).tolist() == [1, 0]
