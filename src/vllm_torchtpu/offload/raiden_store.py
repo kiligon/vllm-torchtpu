@@ -273,8 +273,9 @@ class Admission:
     # success may cover torn bytes. The finalizer treats the admission as
     # failed regardless of the poll verdict.
     poisoned: bool = False
-    # Loads only: owning request and destination device block IDs, reported
-    # through get_block_ids_with_load_errors on failure.
+    # Loads only: owning request and destination device block IDs. A failed
+    # load reaches vLLM by req_id (failed_recving); the block IDs only fill
+    # FinishedJob.failed_device_block_ids, the record of what it left unwritten.
     req_id: str | None = None
     dst_device_block_ids: list[int] = field(default_factory=list)
     # Loads only: the sub-hashes fetched via read_remote — from a peer or the
@@ -328,6 +329,7 @@ class RaidenOffloadingManager(OffloadingManager):
         # Storage tier behind the host DRAM pool: raiden BackendConfigs from
         # `build_store_storage_backend_config`. Empty keeps the store DRAM-only.
         secondary_backend_configs: Sequence[object] = (),
+        dp_rank: int = 0,
         # Test overrides: allow injecting mock store instance and type bindings.
         store: Any = None,
         store_types: Any = None,
@@ -335,6 +337,11 @@ class RaidenOffloadingManager(OffloadingManager):
         assert kernel_physical_blocks_capacity == (
             offload_logical_blocks_capacity * device_block_size_factor
         )
+        if dp_rank < 0:
+            raise ValueError(
+                "TPURaidenOffloadingConnector: dp_rank must be non-negative "
+                f"(from parallel_config.data_parallel_index), got {dp_rank}."
+            )
         self._capacity_keys = offload_logical_blocks_capacity
         self._device_block_size_factor = device_block_size_factor
         self._key_namespace = key_namespace
@@ -375,7 +382,9 @@ class RaidenOffloadingManager(OffloadingManager):
             )
             store = store_types.KVCacheStore(
                 capacity=kernel_physical_blocks_capacity,
-                raiden_id=store_types.RaidenId(raiden_job_name, "0", "kv_cache", 0),
+                raiden_id=store_types.RaidenId(
+                    raiden_job_name, "0", "kv_cache", dp_rank
+                ),
                 # Transfer fanout is dynamically driven by registered workers.
                 num_shards=1,
                 shard_size_bytes=1,
@@ -1395,6 +1404,7 @@ def derive_offload_namespace(
     num_kv_cache_tensors: int,
     cp_geometry: tuple[int, ...] = (),
     block_major_contract: BlockMajorContract | None = None,
+    offloaded_group_ids: tuple[int, ...] | None = None,
 ) -> bytes:
     """Derive a deterministic compatibility namespace prefixed to every store and
     registry key.
@@ -1403,7 +1413,8 @@ def derive_offload_namespace(
     hashing all configuration parameters that alter binary KV cache layout:
     - Model identity: model name, revision, quantization.
     - KV cache geometry: KV data type, kernel block size, per-block tensor shape,
-      device block size, and cache group/tensor counts.
+      device block size, cache group/tensor counts, and which groups are
+      offloaded when that is not all of them.
     - Distributed topology: world size (TP/PP) and context parallelism geometry
       (pcp_size, dcp_size, interleave_size) which alters rank-local token placement.
     - Hash scheme: prefix caching algorithm and namespace version salt.
@@ -1452,6 +1463,13 @@ def derive_offload_namespace(
             block_major_contract.bundle_row_bytes,
             block_major_contract.logical_fingerprint,
         )
+    if offloaded_group_ids is not None and offloaded_group_ids != tuple(
+        range(num_kv_cache_groups)
+    ):
+        # vLLM offloads only the prefix-cacheable groups; an engine that skips
+        # a group never stores its keys, so a peer expecting them would miss
+        # on every block.
+        material_fields += ("tpu-raiden-offload-ns3-groups", offloaded_group_ids)
     material = repr(material_fields)
     return hashlib.sha256(material.encode()).digest()[:16]
 
@@ -2205,13 +2223,27 @@ class StorageRankCoords:
                 )
 
     @property
-    def storage_rank(self) -> int:
-        """Which of a block's shard files this rank writes."""
+    def engine_rank(self) -> int:
+        """This rank's index among its engine's workers, in [0, world_size).
+
+        vLLM lays an engine's ranks out PP x PCP x TP, so that is the group
+        coordinates in the same order. The store registers the worker under
+        it (node_id) and pairs P2P transfers on it -- this replica's worker k
+        reads from the peer's worker k -- so it must name the same KV shard
+        on every replica. The world rank does not: under data parallelism
+        with expert parallelism the torch.distributed world spans every
+        replica, making it `dp_rank * world_size + k`.
+        """
         return (
             self.pp_rank * (self.pcp_size * self.tp_size)
             + self.pcp_rank * self.tp_size
             + self.tp_rank
         )
+
+    @property
+    def storage_rank(self) -> int:
+        """Which of a block's shard files this rank writes: its engine rank."""
+        return self.engine_rank
 
     @property
     def storage_size(self) -> int:
@@ -2222,8 +2254,8 @@ class StorageRankCoords:
 def worker_storage_rank_coords() -> StorageRankCoords:
     """This worker's storage coordinates, read from its TP, PCP, and PP groups.
 
-    Not from the world rank: with data parallelism that counts the ranks of
-    every replica, while storage paths are per TP, PCP, and PP rank.
+    Not from the world rank, which under data parallelism counts every
+    replica's ranks; see `StorageRankCoords.engine_rank`.
     """
     from vllm.distributed import parallel_state
 
@@ -2371,7 +2403,10 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
         # Verify CP scaling invariant: scheduler chunks at the logical all-CP-rank
         # block span, whereas KV cache specs are rank-local. Ensure tokens_per_block
         # scales by pcp_size * dcp_size so OffloadKey spans match scheduler blocks.
-        for group_config, group in zip(config.groups, kv_cache_config.kv_cache_groups):
+        # config.groups holds only the offloaded groups (vLLM leaves out groups
+        # that are not prefix-cacheable), so pair them by group id.
+        for group_config in config.groups:
+            group = kv_cache_config.kv_cache_groups[group_config.group_id]
             if isinstance(group.kv_cache_spec, AttentionSpec):
                 expected_cp_scale = parallel.pcp_size * parallel.dcp_size
                 assert group_config.tokens_per_block == (
@@ -2450,6 +2485,7 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
             num_kv_cache_tensors=len(kv_cache_config.kv_cache_tensors),
             cp_geometry=cp_geometry,
             block_major_contract=self.block_major_contract,
+            offloaded_group_ids=tuple(group.group_id for group in config.groups),
         )
 
         # Shared-memory host pools (RAIDEN_SHM_KEY) are currently unsupported.
@@ -2478,6 +2514,7 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
         dp_rank_local = vllm_config.parallel_config.data_parallel_rank_local
         if dp_rank_local is None:
             dp_rank_local = dp_rank
+        self.dp_rank = vllm_config.parallel_config.data_parallel_index
         base_controller_port = int(
             self.extra_config.get("raiden_controller_port", _DEFAULT_CONTROLLER_PORT)
         )
@@ -2506,8 +2543,8 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
         )
         # Suffix by global DP rank to ensure distinct RaidenId and registry
         # entries across multi-node data parallel replicas.
-        if dp_rank:
-            self.raiden_job_name = f"{self.raiden_job_name}-dp{dp_rank}"
+        if self.dp_rank:
+            self.raiden_job_name = f"{self.raiden_job_name}-dp{self.dp_rank}"
 
         self._manager: RaidenOffloadingManager | None = None
         self._worker: RaidenStoreOffloadingWorker | None = None
@@ -2561,14 +2598,30 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
                 kv_pool_group=self.kv_pool_group,
                 key_namespace=self.key_namespace,
                 secondary_backend_configs=secondary_backend_configs,
+                dp_rank=self.dp_rank,
             )
         return self._manager
 
     def get_worker(self, kv_caches: CanonicalKVCaches) -> OffloadingWorker:
         if self._worker is None:
-            from vllm.distributed import parallel_state
-
-            rank = parallel_state.get_world_group().rank_in_group
+            # The worker's index within its engine, not its world rank: see
+            # StorageRankCoords.engine_rank.
+            coords = worker_storage_rank_coords()
+            # The store expects node ids in [0, world_size) and, with a
+            # storage tier, looks for a block's files under the shard count
+            # from the config; a worker that disagreed would register out of
+            # range or write where the store never looks.
+            assert (coords.tp_size, coords.pcp_size, coords.pp_size) == (
+                self.tp_size,
+                self.pcp_size,
+                self.pp_size,
+            ), (
+                "TPURaidenOffloadingConnector: worker group sizes TP="
+                f"{coords.tp_size}, PCP={coords.pcp_size}, PP={coords.pp_size} != "
+                f"configured TP={self.tp_size}, PCP={self.pcp_size}, "
+                f"PP={self.pp_size}"
+            )
+            rank = coords.engine_rank
             # Direct workers to dial the controller on store_server_ip when configured
             # (bind-and-advertise), falling back to loopback (127.0.0.1) for local runs.
             controller_address = (
@@ -2578,30 +2631,15 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
             if self.storage_config is not None:
                 from tpu_sync.api.torch.kv_cache_manager import _torch_impl
 
-                coords = worker_storage_rank_coords()
-                # The store looks for a block's files under the shard count
-                # from the config; a worker that disagreed would write where
-                # the store never looks.
-                assert (coords.tp_size, coords.pcp_size, coords.pp_size) == (
-                    self.tp_size,
-                    self.pcp_size,
-                    self.pp_size,
-                ), (
-                    "TPURaidenOffloadingConnector: worker group sizes TP="
-                    f"{coords.tp_size}, PCP={coords.pcp_size}, PP={coords.pp_size} != "
-                    f"configured TP={self.tp_size}, PCP={self.pcp_size}, "
-                    f"PP={self.pp_size}"
-                )
                 backend_configs.append(
                     build_worker_storage_backend_config(
                         _torch_impl(), self.storage_config, coords
                     )
                 )
                 logger.info(
-                    "TPURaidenOffloadingConnector: rank %d writes storage shard "
-                    "%d of %d (TP rank %d, PCP rank %d, PP rank %d) under %s",
+                    "TPURaidenOffloadingConnector: worker %d of %d writes its "
+                    "storage shard (TP rank %d, PCP rank %d, PP rank %d) under %s",
                     rank,
-                    coords.storage_rank,
                     coords.storage_size,
                     coords.tp_rank,
                     coords.pcp_rank,
